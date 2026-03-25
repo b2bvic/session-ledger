@@ -1,0 +1,2071 @@
+#!/usr/bin/env python3
+"""
+session-ledger — Full-fidelity Claude session transcript database.
+
+Harvests Claude Code JSONL transcripts into a SQLite database with FTS5
+full-text search. Zero dependencies — stdlib only.
+
+Usage:
+    ledger init                     Create/migrate database
+    ledger harvest [options]        Ingest transcripts
+    ledger search <query> [opts]    Full-text search
+    ledger sessions [list|show]     Browse sessions
+    ledger files [hot|trail]        File operation tracking
+    ledger stats [overview|daily]   Usage statistics
+    ledger status                   Database health
+    ledger query <sql>              Raw SQL access
+
+Config via environment:
+    LEDGER_DB       Database path (default: ~/.claude/session-ledger.db)
+    LEDGER_CLAUDE   Claude config dir (default: ~/.claude)
+    LEDGER_PROJECT  Project dir for session discovery (auto-detected)
+
+🌐 Victor Valentine Romo · victorvalentineromo.com · scalewithsearch.com
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from textwrap import dedent
+from zoneinfo import ZoneInfo
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+VERSION = "1.0.0"
+SCHEMA_VERSION = 1
+
+# Timezone — override with LEDGER_TZ env var
+TZ_NAME = os.environ.get("LEDGER_TZ", "America/New_York")
+ET = ZoneInfo(TZ_NAME)
+
+# Paths — all configurable via environment
+CLAUDE_DIR = Path(os.environ.get("LEDGER_CLAUDE", str(Path.home() / ".claude")))
+DB_PATH = Path(os.environ.get("LEDGER_DB", str(CLAUDE_DIR / "session-ledger.db")))
+USAGE_META_DIR = CLAUDE_DIR / "usage-data" / "session-meta"
+USAGE_FACETS_DIR = CLAUDE_DIR / "usage-data" / "facets"
+
+# Auto-detect project dir: find the first project in ~/.claude/projects/
+def _find_project_dir():
+    projects = CLAUDE_DIR / "projects"
+    override = os.environ.get("LEDGER_PROJECT")
+    if override:
+        return Path(override)
+    if projects.exists():
+        dirs = sorted(projects.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+        for d in dirs:
+            if d.is_dir() and not d.name.startswith("."):
+                return d
+    return projects
+
+PROJECTS_DIR = _find_project_dir()
+SESSIONS_INDEX = PROJECTS_DIR / "sessions-index.json"
+
+# Domain classification — customize by creating ~/.config/ledger/domains.json
+# Format: {"domain_name": ["keyword1", "keyword2", ...]}
+DOMAIN_KEYWORDS = {
+    "code": ["function", "class", "bug", "test", "refactor", "api", "deploy"],
+    "docs": ["documentation", "readme", "guide", "tutorial", "explain"],
+    "ops": ["server", "deploy", "ci", "cd", "docker", "build", "infra"],
+}
+
+# Try to load user-defined domains
+_domains_file = Path.home() / ".config" / "ledger" / "domains.json"
+if _domains_file.exists():
+    try:
+        DOMAIN_KEYWORDS = json.loads(_domains_file.read_text())
+    except (json.JSONDecodeError, KeyError):
+        pass
+
+# Domain names for schema
+_domain_names = list(DOMAIN_KEYWORDS.keys())
+
+# Domain classification — file path patterns (optional, configurable)
+DOMAIN_PATHS = {}
+
+# Model pricing ($ per million tokens)
+MODEL_PRICING = {
+    "claude-opus-4-6": {"input": 15.0, "output": 75.0, "cache_create": 18.75, "cache_read": 1.50},
+    "claude-sonnet-4-5-20250929": {"input": 3.0, "output": 15.0, "cache_create": 3.75, "cache_read": 0.30},
+    "claude-haiku-4-5-20251001": {"input": 0.8, "output": 4.0, "cache_create": 1.00, "cache_read": 0.08},
+    "<synthetic>": {"input": 0.0, "output": 0.0, "cache_create": 0.0, "cache_read": 0.0},
+}
+
+
+# ---------------------------------------------------------------------------
+# Schema SQL
+# ---------------------------------------------------------------------------
+
+SCHEMA_SQL = """
+PRAGMA journal_mode = WAL;
+PRAGMA foreign_keys = ON;
+PRAGMA auto_vacuum = INCREMENTAL;
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id              INTEGER PRIMARY KEY,
+    session_uuid    TEXT NOT NULL,
+    source          TEXT NOT NULL,
+    project_path    TEXT,
+    jsonl_path      TEXT,
+    vault_file      TEXT,
+
+    started_at      TEXT NOT NULL,
+    ended_at        TEXT,
+    duration_ms     INTEGER,
+
+    primary_domain  TEXT,
+    domains         TEXT,
+    purpose         TEXT,
+    tags            TEXT,
+    summary         TEXT,
+
+    primary_model   TEXT,
+    models_used     TEXT,
+    claude_version  TEXT,
+
+    total_input_tokens      INTEGER DEFAULT 0,
+    total_output_tokens     INTEGER DEFAULT 0,
+    total_cache_create      INTEGER DEFAULT 0,
+    total_cache_read        INTEGER DEFAULT 0,
+    estimated_cost_usd      REAL DEFAULT 0.0,
+
+    message_count       INTEGER DEFAULT 0,
+    user_message_count  INTEGER DEFAULT 0,
+    assistant_turn_count INTEGER DEFAULT 0,
+    tool_use_count      INTEGER DEFAULT 0,
+    files_read_count    INTEGER DEFAULT 0,
+    files_written_count INTEGER DEFAULT 0,
+    files_edited_count  INTEGER DEFAULT 0,
+    compact_count       INTEGER DEFAULT 0,
+
+    subagent_count  INTEGER DEFAULT 0,
+    first_prompt    TEXT,
+
+    is_harvested    INTEGER DEFAULT 0 CHECK (is_harvested IN (0, 1)),
+    harvest_version INTEGER DEFAULT 1,
+    harvested_at    TEXT,
+    raw_line_count  INTEGER DEFAULT 0,
+
+    concurrency_group_id INTEGER,
+
+    UNIQUE(session_uuid, source)
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id              INTEGER PRIMARY KEY,
+    session_id      INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    uuid            TEXT,
+    parent_uuid     TEXT,
+    timestamp       TEXT NOT NULL,
+
+    role            TEXT NOT NULL CHECK (role IN (
+                        'user', 'assistant', 'system', 'tool_result'
+                    )),
+    message_type    TEXT,
+    subtype         TEXT,
+
+    content_text    TEXT,
+    content_json    TEXT,
+    raw_json        TEXT,
+
+    model           TEXT,
+    request_id      TEXT,
+    stop_reason     TEXT,
+
+    input_tokens    INTEGER,
+    output_tokens   INTEGER,
+    cache_create_tokens INTEGER,
+    cache_read_tokens   INTEGER,
+
+    is_sidechain    INTEGER DEFAULT 0 CHECK (is_sidechain IN (0, 1)),
+    is_compact_summary INTEGER DEFAULT 0 CHECK (is_compact_summary IN (0, 1)),
+
+    sequence_num    INTEGER NOT NULL,
+
+    agent_id        TEXT,
+    agent_slug      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS tool_uses (
+    id              INTEGER PRIMARY KEY,
+    message_id      INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    session_id      INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    tool_use_id     TEXT NOT NULL,
+    tool_name       TEXT NOT NULL,
+    input_json      TEXT,
+    timestamp       TEXT NOT NULL,
+
+    file_path       TEXT,
+    command         TEXT,
+    pattern         TEXT,
+    description     TEXT,
+
+    result_message_id INTEGER REFERENCES messages(id),
+    result_text     TEXT,
+    is_error        INTEGER DEFAULT 0 CHECK (is_error IN (0, 1)),
+    duration_ms     INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS file_operations (
+    id              INTEGER PRIMARY KEY,
+    session_id      INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    file_path       TEXT NOT NULL,
+    operation       TEXT NOT NULL CHECK (operation IN ('read', 'write', 'edit', 'glob', 'grep')),
+    first_at        TEXT NOT NULL,
+    last_at         TEXT NOT NULL,
+    operation_count INTEGER DEFAULT 1,
+    vault_relative  TEXT,
+    domain          TEXT,
+
+    UNIQUE(session_id, file_path, operation)
+);
+
+CREATE TABLE IF NOT EXISTS compactions (
+    id              INTEGER PRIMARY KEY,
+    session_id      INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    message_id      INTEGER REFERENCES messages(id),
+    pre_tokens      INTEGER,
+    summary_text    TEXT,
+    timestamp       TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS subagents (
+    id              INTEGER PRIMARY KEY,
+    session_id      INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    agent_id        TEXT NOT NULL,
+    slug            TEXT,
+    model           TEXT,
+    jsonl_path      TEXT,
+    message_count   INTEGER DEFAULT 0,
+    tool_use_count  INTEGER DEFAULT 0,
+    input_tokens    INTEGER DEFAULT 0,
+    output_tokens   INTEGER DEFAULT 0,
+    started_at      TEXT,
+    ended_at        TEXT,
+
+    UNIQUE(session_id, agent_id)
+);
+
+CREATE TABLE IF NOT EXISTS concurrency_groups (
+    id              INTEGER PRIMARY KEY,
+    started_at      TEXT NOT NULL,
+    ended_at        TEXT,
+    session_count   INTEGER DEFAULT 0,
+    domains         TEXT,
+    description     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS harvest_log (
+    id              INTEGER PRIMARY KEY,
+    file_path       TEXT NOT NULL,
+    file_hash       TEXT NOT NULL,
+    file_size       INTEGER,
+    file_mtime      TEXT,
+    session_uuid    TEXT,
+    harvested_at    TEXT NOT NULL,
+    line_count      INTEGER,
+    message_count   INTEGER,
+    status          TEXT DEFAULT 'complete' CHECK (status IN ('complete', 'partial', 'error')),
+    error_text      TEXT,
+    harvest_version INTEGER DEFAULT 1,
+
+    UNIQUE(file_path, file_hash)
+);
+
+CREATE TABLE IF NOT EXISTS model_pricing (
+    id              INTEGER PRIMARY KEY,
+    model_name      TEXT NOT NULL,
+    effective_date  TEXT NOT NULL,
+    input_per_mtok  REAL NOT NULL,
+    output_per_mtok REAL NOT NULL,
+    cache_create_per_mtok REAL DEFAULT 0,
+    cache_read_per_mtok REAL DEFAULT 0,
+    notes           TEXT,
+
+    UNIQUE(model_name, effective_date)
+);
+
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_sessions_uuid ON sessions(session_uuid);
+CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_domain ON sessions(primary_domain);
+CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
+CREATE INDEX IF NOT EXISTS idx_sessions_group ON sessions(concurrency_group_id);
+
+CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, sequence_num);
+CREATE INDEX IF NOT EXISTS idx_messages_uuid ON messages(uuid);
+CREATE INDEX IF NOT EXISTS idx_messages_role ON messages(session_id, role);
+CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
+CREATE INDEX IF NOT EXISTS idx_messages_model ON messages(model);
+
+CREATE INDEX IF NOT EXISTS idx_tools_session ON tool_uses(session_id);
+CREATE INDEX IF NOT EXISTS idx_tools_name ON tool_uses(tool_name);
+CREATE INDEX IF NOT EXISTS idx_tools_file ON tool_uses(file_path);
+CREATE INDEX IF NOT EXISTS idx_tools_message ON tool_uses(message_id);
+
+CREATE INDEX IF NOT EXISTS idx_fileops_session ON file_operations(session_id);
+CREATE INDEX IF NOT EXISTS idx_fileops_path ON file_operations(file_path);
+CREATE INDEX IF NOT EXISTS idx_fileops_domain ON file_operations(domain);
+
+CREATE INDEX IF NOT EXISTS idx_compactions_session ON compactions(session_id);
+CREATE INDEX IF NOT EXISTS idx_subagents_session ON subagents(session_id);
+CREATE INDEX IF NOT EXISTS idx_harvest_path ON harvest_log(file_path);
+
+-- Vault file index: every markdown file in the Obsidian vault
+CREATE TABLE IF NOT EXISTS vault_files (
+    id              INTEGER PRIMARY KEY,
+    file_path       TEXT NOT NULL UNIQUE,    -- absolute path
+    vault_relative  TEXT NOT NULL,           -- path relative to vault root
+    domain          TEXT,                    -- inferred from path
+    title           TEXT,                    -- first # heading or filename
+    frontmatter     TEXT,                    -- raw YAML/field:: frontmatter
+    content_text    TEXT,                    -- full file content for FTS
+    char_count      INTEGER DEFAULT 0,
+    word_count      INTEGER DEFAULT 0,
+    file_hash       TEXT,                    -- SHA-256 for change detection
+    file_mtime      TEXT,                    -- ISO 8601 last modified
+    file_size       INTEGER,
+    created_at      TEXT,                    -- file creation time
+    harvested_at    TEXT NOT NULL,
+    harvest_version INTEGER DEFAULT 1
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_files_path ON vault_files(vault_relative);
+CREATE INDEX IF NOT EXISTS idx_vault_files_domain ON vault_files(domain);
+CREATE INDEX IF NOT EXISTS idx_vault_files_mtime ON vault_files(file_mtime);
+
+-- FTS5 for vault file content
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_vault_files USING fts5(
+    vault_relative,
+    title,
+    content_text,
+    content='vault_files',
+    content_rowid='id',
+    tokenize='porter unicode61 remove_diacritics 2'
+);
+
+-- FTS sync triggers for vault files
+CREATE TRIGGER IF NOT EXISTS fts_vault_files_ai AFTER INSERT ON vault_files
+WHEN NEW.content_text IS NOT NULL AND NEW.content_text != ''
+BEGIN
+    INSERT INTO fts_vault_files(rowid, vault_relative, title, content_text)
+        VALUES (NEW.id, NEW.vault_relative, NEW.title, NEW.content_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS fts_vault_files_ad AFTER DELETE ON vault_files
+WHEN OLD.content_text IS NOT NULL AND OLD.content_text != ''
+BEGIN
+    INSERT INTO fts_vault_files(fts_vault_files, rowid, vault_relative, title, content_text)
+        VALUES ('delete', OLD.id, OLD.vault_relative, OLD.title, OLD.content_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS fts_vault_files_au AFTER UPDATE ON vault_files
+WHEN OLD.content_text IS NOT NULL AND OLD.content_text != ''
+BEGIN
+    INSERT INTO fts_vault_files(fts_vault_files, rowid, vault_relative, title, content_text)
+        VALUES ('delete', OLD.id, OLD.vault_relative, OLD.title, OLD.content_text);
+    INSERT INTO fts_vault_files(rowid, vault_relative, title, content_text)
+        VALUES (NEW.id, NEW.vault_relative, NEW.title, NEW.content_text);
+END;
+
+-- Unified FTS for vault files
+CREATE TRIGGER IF NOT EXISTS fts_unified_vault_ai AFTER INSERT ON vault_files
+WHEN NEW.content_text IS NOT NULL AND length(NEW.content_text) > 20
+BEGIN
+    INSERT INTO fts_unified(source_type, session_uuid, domain, timestamp, content_text)
+    VALUES ('vault_file', 'vault-' || NEW.id, NEW.domain, NEW.file_mtime, NEW.content_text);
+END;
+
+-- FTS5 full-text search
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
+    content_text,
+    content='messages',
+    content_rowid='id',
+    tokenize='porter unicode61 remove_diacritics 2'
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_unified USING fts5(
+    source_type,
+    session_uuid,
+    domain,
+    timestamp,
+    content_text,
+    tokenize='porter unicode61 remove_diacritics 2'
+);
+
+-- FTS sync triggers
+CREATE TRIGGER IF NOT EXISTS fts_messages_ai AFTER INSERT ON messages
+WHEN NEW.content_text IS NOT NULL AND NEW.content_text != ''
+BEGIN
+    INSERT INTO fts_messages(rowid, content_text) VALUES (NEW.id, NEW.content_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS fts_messages_ad AFTER DELETE ON messages
+WHEN OLD.content_text IS NOT NULL AND OLD.content_text != ''
+BEGIN
+    INSERT INTO fts_messages(fts_messages, rowid, content_text)
+        VALUES ('delete', OLD.id, OLD.content_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS fts_unified_msg_ai AFTER INSERT ON messages
+WHEN NEW.content_text IS NOT NULL AND NEW.content_text != '' AND length(NEW.content_text) > 20
+BEGIN
+    INSERT INTO fts_unified(source_type, session_uuid, domain, timestamp, content_text)
+    SELECT
+        CASE NEW.role
+            WHEN 'user' THEN 'user_message'
+            WHEN 'assistant' THEN 'assistant_message'
+            ELSE 'system_message'
+        END,
+        s.session_uuid,
+        s.primary_domain,
+        NEW.timestamp,
+        NEW.content_text
+    FROM sessions s WHERE s.id = NEW.session_id;
+END;
+
+-- Views
+CREATE VIEW IF NOT EXISTS v_recent_sessions AS
+SELECT
+    s.id,
+    s.session_uuid,
+    s.source,
+    s.started_at,
+    s.ended_at,
+    CAST(s.duration_ms / 60000.0 AS INTEGER) AS duration_min,
+    s.primary_domain,
+    s.domains,
+    s.purpose,
+    s.primary_model,
+    s.message_count,
+    s.tool_use_count,
+    s.total_input_tokens,
+    s.total_output_tokens,
+    s.estimated_cost_usd,
+    s.subagent_count,
+    s.compact_count,
+    s.first_prompt,
+    s.summary
+FROM sessions s
+ORDER BY s.started_at DESC;
+
+CREATE VIEW IF NOT EXISTS v_domain_summary AS
+SELECT
+    COALESCE(s.primary_domain, 'UNCLASSIFIED') AS domain,
+    COUNT(*) AS session_count,
+    SUM(s.message_count) AS total_messages,
+    SUM(s.tool_use_count) AS total_tool_uses,
+    SUM(s.total_output_tokens) AS total_output_tokens,
+    SUM(s.estimated_cost_usd) AS total_cost_usd,
+    SUM(s.duration_ms) / 60000 AS total_minutes
+FROM sessions s
+GROUP BY s.primary_domain
+ORDER BY total_messages DESC;
+
+CREATE VIEW IF NOT EXISTS v_daily_activity AS
+SELECT
+    DATE(s.started_at) AS day,
+    COUNT(*) AS sessions,
+    SUM(s.message_count) AS messages,
+    SUM(s.tool_use_count) AS tools,
+    ROUND(SUM(s.estimated_cost_usd), 2) AS cost_usd,
+    ROUND(SUM(s.duration_ms) / 3600000.0, 1) AS hours,
+    GROUP_CONCAT(DISTINCT s.primary_domain) AS domains
+FROM sessions s
+GROUP BY DATE(s.started_at)
+ORDER BY day DESC;
+
+CREATE VIEW IF NOT EXISTS v_hot_files AS
+SELECT
+    fo.vault_relative,
+    fo.domain,
+    COUNT(DISTINCT fo.session_id) AS sessions_touched,
+    SUM(fo.operation_count) AS total_operations,
+    SUM(CASE WHEN fo.operation = 'read' THEN fo.operation_count ELSE 0 END) AS reads,
+    SUM(CASE WHEN fo.operation = 'write' THEN fo.operation_count ELSE 0 END) AS writes,
+    SUM(CASE WHEN fo.operation = 'edit' THEN fo.operation_count ELSE 0 END) AS edits,
+    MAX(fo.last_at) AS last_touched
+FROM file_operations fo
+WHERE fo.vault_relative IS NOT NULL
+GROUP BY fo.vault_relative
+ORDER BY sessions_touched DESC;
+
+CREATE VIEW IF NOT EXISTS v_tool_stats AS
+SELECT
+    tu.tool_name,
+    COUNT(*) AS invocations,
+    COUNT(DISTINCT tu.session_id) AS sessions_used,
+    SUM(CASE WHEN tu.is_error = 1 THEN 1 ELSE 0 END) AS errors,
+    ROUND(100.0 * SUM(CASE WHEN tu.is_error = 1 THEN 1 ELSE 0 END) / COUNT(*), 1) AS error_pct
+FROM tool_uses tu
+GROUP BY tu.tool_name
+ORDER BY invocations DESC;
+"""
+
+SEED_PRICING_SQL = """
+INSERT OR IGNORE INTO model_pricing
+    (model_name, effective_date, input_per_mtok, output_per_mtok, cache_create_per_mtok, cache_read_per_mtok, notes)
+VALUES
+    ('claude-opus-4-6',           '2026-02-05', 15.0, 75.0,  18.75, 1.50, 'Opus 4.6'),
+    ('claude-sonnet-4-5-20250929','2025-09-29',  3.0, 15.0,   3.75, 0.30, 'Sonnet 4.5'),
+    ('claude-haiku-4-5-20251001', '2025-10-01',  0.8,  4.0,   1.00, 0.08, 'Haiku 4.5'),
+    ('<synthetic>',               '2025-01-01',  0.0,  0.0,   0.00, 0.00, 'System-generated');
+"""
+
+
+# ---------------------------------------------------------------------------
+# Database connection
+# ---------------------------------------------------------------------------
+
+
+def get_db(db_path: Path = DB_PATH) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), timeout=10)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+# ---------------------------------------------------------------------------
+# Init command
+# ---------------------------------------------------------------------------
+
+
+def cmd_init(args):
+    """Create or migrate the database schema."""
+    conn = get_db()
+    try:
+        conn.executescript(SCHEMA_SQL)
+        conn.executescript(SEED_PRICING_SQL)
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+            ("schema_version", str(SCHEMA_VERSION)),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+            ("created_at", datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+        print(f"Database initialized at {DB_PATH}")
+        print(f"  Schema version: {SCHEMA_VERSION}")
+        print(f"  Size: {DB_PATH.stat().st_size / 1024:.1f} KB")
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# JSONL parsing utilities
+# ---------------------------------------------------------------------------
+
+
+def file_sha256(filepath: Path) -> str:
+    h = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def parse_timestamp(ts) -> "str | None":
+    """Convert any timestamp format to ISO 8601 UTC string."""
+    if not ts:
+        return None
+    try:
+        if isinstance(ts, str):
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            return dt.astimezone(timezone.utc).isoformat()
+        if isinstance(ts, (int, float)):
+            epoch = ts / 1000 if ts > 1e12 else ts
+            dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+            return dt.astimezone(timezone.utc).isoformat()
+    except (ValueError, OSError, OverflowError):
+        pass
+    return None
+
+
+def extract_text_content(content) -> "str | None":
+    """Extract human-readable text from message content field."""
+    if isinstance(content, str):
+        return content.strip() or None
+    if isinstance(content, list):
+        texts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                t = block.get("text", "").strip()
+                if t:
+                    texts.append(t)
+        return "\n\n".join(texts) if texts else None
+    return None
+
+
+def extract_tool_uses_from_content(content) -> list[dict]:
+    """Extract tool_use blocks from assistant message content."""
+    if not isinstance(content, list):
+        return []
+    tools = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            tool = {
+                "tool_use_id": block.get("id", ""),
+                "tool_name": block.get("name", ""),
+                "input": block.get("input", {}),
+            }
+            # Extract denormalized fields for common tools
+            inp = tool["input"]
+            if isinstance(inp, dict):
+                tool["file_path"] = inp.get("file_path") or inp.get("path")
+                tool["command"] = inp.get("command")
+                tool["pattern"] = inp.get("pattern")
+                tool["description"] = inp.get("description")
+            tools.append(tool)
+    return tools
+
+
+def extract_tool_results(content) -> list[dict]:
+    """Extract tool_result blocks from user messages (tool returns)."""
+    if not isinstance(content, list):
+        return []
+    results = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_result":
+            result_content = block.get("content", "")
+            if isinstance(result_content, list):
+                texts = []
+                for rb in result_content:
+                    if isinstance(rb, dict) and rb.get("type") == "text":
+                        texts.append(rb.get("text", ""))
+                result_content = "\n".join(texts)
+            results.append({
+                "tool_use_id": block.get("tool_use_id", ""),
+                "content": str(result_content)[:10000],  # cap at 10K chars
+                "is_error": block.get("is_error", False),
+            })
+    return results
+
+
+def classify_domain_from_text(text: str) -> "str | None":
+    """Classify domain from message text using keyword matching."""
+    if not text:
+        return None
+    text_lower = text.lower()
+    scores = {}
+    for domain, keywords in DOMAIN_KEYWORDS.items():
+        count = sum(1 for kw in keywords if kw in text_lower)
+        if count > 0:
+            scores[domain] = count
+    if not scores:
+        return None
+    return max(scores, key=scores.get)
+
+
+def classify_domain_from_path(filepath: str) -> "str | None":
+    """Classify domain from a vault file path."""
+    if not filepath:
+        return None
+    for domain, pattern in DOMAIN_PATHS.items():
+        if pattern in filepath:
+            return domain
+    return None
+
+
+def vault_relative_path(filepath: str) -> "str | None":
+    """Convert absolute path to vault-relative path."""
+    if not filepath:
+        return None
+    vault_str = str(VAULT_ROOT) + "/"
+    if filepath.startswith(vault_str):
+        return filepath[len(vault_str):]
+    return None
+
+
+def estimate_cost(model: str, input_tok: int, output_tok: int,
+                  cache_create: int = 0, cache_read: int = 0) -> float:
+    """Estimate API cost in USD for a message."""
+    pricing = MODEL_PRICING.get(model)
+    if not pricing:
+        return 0.0
+    cost = (
+        input_tok * pricing["input"] / 1_000_000
+        + output_tok * pricing["output"] / 1_000_000
+        + cache_create * pricing["cache_create"] / 1_000_000
+        + cache_read * pricing["cache_read"] / 1_000_000
+    )
+    return cost
+
+
+# ---------------------------------------------------------------------------
+# Harvester
+# ---------------------------------------------------------------------------
+
+
+def harvest_jsonl(conn: sqlite3.Connection, jsonl_path: Path,
+                  dry_run: bool = False, force: bool = False) -> dict:
+    """Harvest a single JSONL transcript into the database.
+
+    Returns dict with counts: messages, tool_uses, files, errors.
+    """
+    stats = {"messages": 0, "tool_uses": 0, "file_ops": 0, "errors": 0, "skipped": False}
+
+    # Check harvest log
+    fhash = file_sha256(jsonl_path)
+    fsize = jsonl_path.stat().st_size
+    fmtime = datetime.fromtimestamp(jsonl_path.stat().st_mtime, tz=timezone.utc).isoformat()
+
+    if not force:
+        existing = conn.execute(
+            "SELECT id FROM harvest_log WHERE file_path = ? AND file_hash = ?",
+            (str(jsonl_path), fhash)
+        ).fetchone()
+        if existing:
+            stats["skipped"] = True
+            return stats
+
+    if dry_run:
+        stats["skipped"] = True
+        return stats
+
+    # Extract session UUID from filename
+    stem = jsonl_path.stem
+    session_uuid = stem  # UUID is the filename
+
+    # Read all lines
+    lines = []
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped:
+                try:
+                    lines.append(json.loads(stripped))
+                except json.JSONDecodeError:
+                    stats["errors"] += 1
+
+    if not lines:
+        return stats
+
+    # Extract session metadata
+    first_ts = None
+    last_ts = None
+    models_seen = set()
+    version = None
+    first_prompt = None
+    domain_signals = []
+    total_input = 0
+    total_output = 0
+    total_cache_create = 0
+    total_cache_read = 0
+    user_count = 0
+    assistant_count = 0
+    tool_count = 0
+    compact_count = 0
+
+    # Pending tool_use → tool_result linkage
+    pending_tool_uses = {}  # tool_use_id → tool_uses.id
+
+    # Create or update session row
+    # Check if session already exists (re-harvest)
+    existing_session = conn.execute(
+        "SELECT id FROM sessions WHERE session_uuid = ? AND source = 'claude-code'",
+        (session_uuid,)
+    ).fetchone()
+
+    if existing_session:
+        session_id = existing_session["id"]
+        # Clear old data for re-harvest
+        conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM tool_uses WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM file_operations WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM compactions WHERE session_id = ?", (session_id,))
+    else:
+        # Insert placeholder session row
+        conn.execute(
+            """INSERT INTO sessions (session_uuid, source, project_path, jsonl_path, started_at,
+               is_harvested, harvest_version, harvested_at, raw_line_count)
+               VALUES (?, 'claude-code', ?, ?, ?, 0, ?, ?, ?)""",
+            (session_uuid, str(PROJECTS_DIR), str(jsonl_path),
+             datetime.now(timezone.utc).isoformat(),
+             SCHEMA_VERSION, datetime.now(timezone.utc).isoformat(), len(lines))
+        )
+        session_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    # Process each JSONL line
+    file_ops_tracker = {}  # (file_path, operation) → {first_at, last_at, count}
+
+    for seq_num, record in enumerate(lines):
+        if not isinstance(record, dict):
+            continue
+        rtype = record.get("type")
+        timestamp = parse_timestamp(record.get("timestamp"))
+
+        if timestamp:
+            if first_ts is None or timestamp < first_ts:
+                first_ts = timestamp
+            if last_ts is None or timestamp > last_ts:
+                last_ts = timestamp
+
+        if rtype == "user":
+            msg = record.get("message", {})
+            content = msg.get("content")
+            content_text = extract_text_content(content)
+            is_sidechain = 1 if record.get("isSidechain") else 0
+
+            if record.get("version"):
+                version = record["version"]
+
+            # Check if this is a tool result
+            tool_results = extract_tool_results(content) if isinstance(content, list) else []
+
+            if tool_results:
+                # This is a tool result message
+                for tr in tool_results:
+                    conn.execute(
+                        """INSERT INTO messages (session_id, uuid, parent_uuid, timestamp,
+                           role, message_type, content_text, content_json, raw_json,
+                           is_sidechain, sequence_num)
+                           VALUES (?, ?, ?, ?, 'tool_result', 'user', ?, ?, ?, ?, ?)""",
+                        (session_id, record.get("uuid"), record.get("parentUuid"),
+                         timestamp or datetime.now(timezone.utc).isoformat(),
+                         tr["content"][:5000], json.dumps(content) if content else None,
+                         json.dumps(record),
+                         is_sidechain, seq_num)
+                    )
+                    msg_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                    stats["messages"] += 1
+
+                    # Link tool result back to tool_use
+                    tuid = tr["tool_use_id"]
+                    if tuid in pending_tool_uses:
+                        conn.execute(
+                            "UPDATE tool_uses SET result_message_id = ?, result_text = ?, is_error = ? WHERE id = ?",
+                            (msg_id, tr["content"][:10000],
+                             1 if tr["is_error"] else 0,
+                             pending_tool_uses[tuid])
+                        )
+                        del pending_tool_uses[tuid]
+            else:
+                # Real user message
+                if not record.get("isMeta") and content_text and first_prompt is None:
+                    first_prompt = content_text[:500]
+                    domain_signals.append(content_text)
+
+                if not record.get("isMeta") and content_text:
+                    user_count += 1
+                    domain_signals.append(content_text)
+
+                conn.execute(
+                    """INSERT INTO messages (session_id, uuid, parent_uuid, timestamp,
+                       role, message_type, content_text, content_json, raw_json,
+                       is_sidechain, sequence_num)
+                       VALUES (?, ?, ?, ?, 'user', 'user', ?, ?, ?, ?, ?)""",
+                    (session_id, record.get("uuid"), record.get("parentUuid"),
+                     timestamp or datetime.now(timezone.utc).isoformat(),
+                     content_text,
+                     json.dumps(content) if isinstance(content, list) else None,
+                     json.dumps(record),
+                     is_sidechain, seq_num)
+                )
+                stats["messages"] += 1
+
+        elif rtype == "assistant":
+            msg = record.get("message", {})
+            content = msg.get("content", [])
+            content_text = extract_text_content(content)
+            model = msg.get("model")
+            usage = msg.get("usage", {})
+
+            if model and model != "<synthetic>":
+                models_seen.add(model)
+
+            # Token accounting
+            in_tok = usage.get("input_tokens", 0) or 0
+            out_tok = usage.get("output_tokens", 0) or 0
+            cc_tok = usage.get("cache_creation_input_tokens", 0) or 0
+            cr_tok = usage.get("cache_read_input_tokens", 0) or 0
+            total_input += in_tok
+            total_output += out_tok
+            total_cache_create += cc_tok
+            total_cache_read += cr_tok
+
+            assistant_count += 1
+
+            conn.execute(
+                """INSERT INTO messages (session_id, uuid, parent_uuid, timestamp,
+                   role, message_type, content_text, content_json, raw_json,
+                   model, request_id, stop_reason,
+                   input_tokens, output_tokens, cache_create_tokens, cache_read_tokens,
+                   is_sidechain, sequence_num)
+                   VALUES (?, ?, ?, ?, 'assistant', 'assistant', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, record.get("uuid"), record.get("parentUuid"),
+                 timestamp or datetime.now(timezone.utc).isoformat(),
+                 content_text,
+                 json.dumps(content) if isinstance(content, list) else None,
+                 json.dumps(record),
+                 model, msg.get("id"), msg.get("stop_reason"),
+                 in_tok, out_tok, cc_tok, cr_tok,
+                 1 if record.get("isSidechain") else 0, seq_num)
+            )
+            msg_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            stats["messages"] += 1
+
+            if content_text:
+                domain_signals.append(content_text)
+
+            # Extract tool uses
+            tool_uses = extract_tool_uses_from_content(content)
+            for tu in tool_uses:
+                tool_count += 1
+                conn.execute(
+                    """INSERT INTO tool_uses (message_id, session_id, tool_use_id, tool_name,
+                       input_json, timestamp, file_path, command, pattern, description)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (msg_id, session_id, tu["tool_use_id"], tu["tool_name"],
+                     json.dumps(tu["input"]),
+                     timestamp or datetime.now(timezone.utc).isoformat(),
+                     tu.get("file_path"), tu.get("command"),
+                     tu.get("pattern"), tu.get("description"))
+                )
+                tu_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                pending_tool_uses[tu["tool_use_id"]] = tu_id
+                stats["tool_uses"] += 1
+
+                # Track file operations
+                fp = tu.get("file_path")
+                if fp:
+                    op_name = tu["tool_name"].lower()
+                    if op_name in ("read", "write", "edit", "glob", "grep"):
+                        key = (fp, op_name)
+                        ts_str = timestamp or datetime.now(timezone.utc).isoformat()
+                        if key in file_ops_tracker:
+                            file_ops_tracker[key]["last_at"] = ts_str
+                            file_ops_tracker[key]["count"] += 1
+                        else:
+                            file_ops_tracker[key] = {
+                                "first_at": ts_str,
+                                "last_at": ts_str,
+                                "count": 1,
+                            }
+
+        elif rtype == "system":
+            subtype = record.get("subtype")
+            content_text = None
+
+            if subtype == "compact_boundary":
+                compact_count += 1
+                summary_content = record.get("summary")
+                if isinstance(summary_content, list):
+                    summary_content = extract_text_content(summary_content)
+                elif isinstance(summary_content, str):
+                    pass
+                else:
+                    summary_content = None
+
+                conn.execute(
+                    """INSERT INTO messages (session_id, uuid, parent_uuid, timestamp,
+                       role, message_type, subtype, content_text, raw_json,
+                       is_compact_summary, sequence_num)
+                       VALUES (?, ?, ?, ?, 'system', 'system', ?, ?, ?, 1, ?)""",
+                    (session_id, record.get("uuid"), record.get("parentUuid"),
+                     timestamp or datetime.now(timezone.utc).isoformat(),
+                     subtype, summary_content, json.dumps(record), seq_num)
+                )
+
+                if summary_content:
+                    msg_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                    conn.execute(
+                        "INSERT INTO compactions (session_id, message_id, pre_tokens, summary_text, timestamp) VALUES (?, ?, ?, ?, ?)",
+                        (session_id, msg_id, record.get("preTokens"),
+                         summary_content, timestamp or datetime.now(timezone.utc).isoformat())
+                    )
+            else:
+                conn.execute(
+                    """INSERT INTO messages (session_id, uuid, parent_uuid, timestamp,
+                       role, message_type, subtype, content_text, raw_json, sequence_num)
+                       VALUES (?, ?, ?, ?, 'system', 'system', ?, ?, ?, ?)""",
+                    (session_id, record.get("uuid"), record.get("parentUuid"),
+                     timestamp or datetime.now(timezone.utc).isoformat(),
+                     subtype, str(record.get("content", ""))[:1000],
+                     json.dumps(record), seq_num)
+                )
+            stats["messages"] += 1
+
+        # Skip progress, file-history-snapshot, queue-operation, last-prompt
+        # They're captured in raw_json of adjacent messages
+
+    # Insert file operations
+    for (fp, op), tracker in file_ops_tracker.items():
+        vrel = vault_relative_path(fp)
+        domain = classify_domain_from_path(fp)
+        try:
+            conn.execute(
+                """INSERT OR REPLACE INTO file_operations
+                   (session_id, file_path, operation, first_at, last_at, operation_count, vault_relative, domain)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, fp, op, tracker["first_at"], tracker["last_at"],
+                 tracker["count"], vrel, domain)
+            )
+            stats["file_ops"] += 1
+        except sqlite3.Error:
+            stats["errors"] += 1
+
+    # Classify domain
+    all_text = " ".join(domain_signals[:20])  # first 20 signals
+    text_domain = classify_domain_from_text(all_text)
+
+    # Also check file operations for domain signals
+    path_domains = {}
+    for (fp, _) in file_ops_tracker:
+        d = classify_domain_from_path(fp)
+        if d:
+            path_domains[d] = path_domains.get(d, 0) + 1
+
+    primary_domain = text_domain
+    if path_domains:
+        path_winner = max(path_domains, key=path_domains.get)
+        if not primary_domain or path_domains[path_winner] > 3:
+            primary_domain = path_winner
+
+    all_domains = set()
+    if text_domain:
+        all_domains.add(text_domain)
+    all_domains.update(path_domains.keys())
+    domains_str = ",".join(sorted(all_domains)) if all_domains else None
+
+    # Compute duration
+    duration_ms = None
+    if first_ts and last_ts:
+        try:
+            dt_first = datetime.fromisoformat(first_ts)
+            dt_last = datetime.fromisoformat(last_ts)
+            duration_ms = int((dt_last - dt_first).total_seconds() * 1000)
+        except (ValueError, TypeError):
+            pass
+
+    # Determine primary model
+    primary_model = None
+    if models_seen:
+        # Prefer opus > sonnet > haiku
+        for m in ["claude-opus-4-6", "claude-sonnet-4-5-20250929", "claude-haiku-4-5-20251001"]:
+            if m in models_seen:
+                primary_model = m
+                break
+        if not primary_model:
+            primary_model = next(iter(models_seen))
+
+    # Compute cost
+    total_cost = 0.0
+    if primary_model:
+        total_cost = estimate_cost(
+            primary_model, total_input, total_output,
+            total_cache_create, total_cache_read
+        )
+
+    # Load summary from sessions-index.json if available
+    summary = None
+    if SESSIONS_INDEX.exists():
+        try:
+            idx_raw = json.loads(SESSIONS_INDEX.read_text())
+            # sessions-index.json is a dict with {"version": 1, "entries": [...]}
+            entries = []
+            if isinstance(idx_raw, dict):
+                entries = idx_raw.get("entries", [])
+            elif isinstance(idx_raw, list):
+                entries = idx_raw
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("sessionId") == session_uuid:
+                    summary = entry.get("summary")
+                    if not first_prompt and entry.get("firstPrompt"):
+                        first_prompt = entry["firstPrompt"]
+                    break
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Load enrichment from usage-data if available
+    meta_file = USAGE_META_DIR / f"{session_uuid}.json"
+    if meta_file.exists():
+        try:
+            meta = json.loads(meta_file.read_text())
+            if not summary and meta.get("summary"):
+                summary = meta["summary"]
+            if not first_prompt and meta.get("first_prompt"):
+                first_prompt = meta["first_prompt"]
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Count subagents
+    subagent_dir = PROJECTS_DIR / session_uuid / "subagents"
+    subagent_count = 0
+    if subagent_dir.is_dir():
+        subagent_files = list(subagent_dir.glob("agent-*.jsonl"))
+        subagent_count = len(subagent_files)
+        for sa_file in subagent_files:
+            agent_id_match = re.match(r"agent-(.+)\.jsonl", sa_file.name)
+            agent_id = agent_id_match.group(1) if agent_id_match else sa_file.stem
+            try:
+                sa_lines = []
+                with open(sa_file) as f:
+                    for line in f:
+                        s = line.strip()
+                        if s:
+                            try:
+                                sa_lines.append(json.loads(s))
+                            except json.JSONDecodeError:
+                                pass
+
+                sa_slug = None
+                sa_model = None
+                sa_in = 0
+                sa_out = 0
+                sa_msgs = 0
+                sa_tools = 0
+                sa_first_ts = None
+                sa_last_ts = None
+
+                for sar in sa_lines:
+                    if sar.get("slug"):
+                        sa_slug = sar["slug"]
+                    ts = parse_timestamp(sar.get("timestamp"))
+                    if ts:
+                        if sa_first_ts is None or ts < sa_first_ts:
+                            sa_first_ts = ts
+                        if sa_last_ts is None or ts > sa_last_ts:
+                            sa_last_ts = ts
+                    if sar.get("type") in ("user", "assistant"):
+                        sa_msgs += 1
+                    if sar.get("type") == "assistant":
+                        msg = sar.get("message", {})
+                        if msg.get("model"):
+                            sa_model = msg["model"]
+                        usage = msg.get("usage", {})
+                        sa_in += usage.get("input_tokens", 0) or 0
+                        sa_out += usage.get("output_tokens", 0) or 0
+                        for block in (msg.get("content") or []):
+                            if isinstance(block, dict) and block.get("type") == "tool_use":
+                                sa_tools += 1
+
+                conn.execute(
+                    """INSERT OR REPLACE INTO subagents
+                       (session_id, agent_id, slug, model, jsonl_path,
+                        message_count, tool_use_count, input_tokens, output_tokens,
+                        started_at, ended_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (session_id, agent_id, sa_slug, sa_model, str(sa_file),
+                     sa_msgs, sa_tools, sa_in, sa_out, sa_first_ts, sa_last_ts)
+                )
+            except OSError:
+                pass
+
+    # Update session row with computed data
+    conn.execute(
+        """UPDATE sessions SET
+            started_at = ?, ended_at = ?, duration_ms = ?,
+            primary_domain = ?, domains = ?, summary = ?,
+            primary_model = ?, models_used = ?, claude_version = ?,
+            total_input_tokens = ?, total_output_tokens = ?,
+            total_cache_create = ?, total_cache_read = ?,
+            estimated_cost_usd = ?,
+            message_count = ?, user_message_count = ?,
+            assistant_turn_count = ?, tool_use_count = ?,
+            files_read_count = ?, files_written_count = ?,
+            files_edited_count = ?, compact_count = ?,
+            subagent_count = ?, first_prompt = ?,
+            is_harvested = 1, harvested_at = ?, raw_line_count = ?
+           WHERE id = ?""",
+        (first_ts or datetime.now(timezone.utc).isoformat(),
+         last_ts, duration_ms,
+         primary_domain, domains_str, summary,
+         primary_model, ",".join(sorted(models_seen)) if models_seen else None,
+         version,
+         total_input, total_output, total_cache_create, total_cache_read,
+         total_cost,
+         stats["messages"], user_count, assistant_count, tool_count,
+         sum(1 for (_, op) in file_ops_tracker if op == "read"),
+         sum(1 for (_, op) in file_ops_tracker if op == "write"),
+         sum(1 for (_, op) in file_ops_tracker if op == "edit"),
+         compact_count,
+         subagent_count, first_prompt,
+         datetime.now(timezone.utc).isoformat(), len(lines),
+         session_id)
+    )
+
+    # Record in harvest log
+    conn.execute(
+        """INSERT OR REPLACE INTO harvest_log
+           (file_path, file_hash, file_size, file_mtime, session_uuid,
+            harvested_at, line_count, message_count, status, harvest_version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'complete', ?)""",
+        (str(jsonl_path), fhash, fsize, fmtime, session_uuid,
+         datetime.now(timezone.utc).isoformat(), len(lines),
+         stats["messages"], SCHEMA_VERSION)
+    )
+
+    return stats
+
+
+def build_concurrency_groups(conn: sqlite3.Connection):
+    """Cluster overlapping sessions into concurrency groups."""
+    conn.execute("DELETE FROM concurrency_groups")
+    conn.execute("UPDATE sessions SET concurrency_group_id = NULL")
+
+    sessions = conn.execute(
+        "SELECT id, session_uuid, started_at, ended_at, primary_domain FROM sessions ORDER BY started_at"
+    ).fetchall()
+
+    if not sessions:
+        return
+
+    groups = []  # list of (group_id, [session_ids], start, end, domains)
+    current_group = None
+
+    for s in sessions:
+        s_start = s["started_at"]
+        s_end = s["ended_at"] or s["started_at"]
+
+        if current_group is None:
+            current_group = {
+                "sessions": [s["id"]],
+                "start": s_start,
+                "end": s_end,
+                "domains": {s["primary_domain"]} if s["primary_domain"] else set(),
+            }
+        elif s_start <= current_group["end"]:
+            # Overlaps with current group
+            current_group["sessions"].append(s["id"])
+            if s_end > current_group["end"]:
+                current_group["end"] = s_end
+            if s["primary_domain"]:
+                current_group["domains"].add(s["primary_domain"])
+        else:
+            # No overlap — finalize current group and start new
+            if len(current_group["sessions"]) > 1:
+                groups.append(current_group)
+            current_group = {
+                "sessions": [s["id"]],
+                "start": s_start,
+                "end": s_end,
+                "domains": {s["primary_domain"]} if s["primary_domain"] else set(),
+            }
+
+    if current_group and len(current_group["sessions"]) > 1:
+        groups.append(current_group)
+
+    for grp in groups:
+        conn.execute(
+            "INSERT INTO concurrency_groups (started_at, ended_at, session_count, domains) VALUES (?, ?, ?, ?)",
+            (grp["start"], grp["end"], len(grp["sessions"]),
+             ",".join(sorted(grp["domains"])) if grp["domains"] else None)
+        )
+        group_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        for sid in grp["sessions"]:
+            conn.execute(
+                "UPDATE sessions SET concurrency_group_id = ? WHERE id = ?",
+                (group_id, sid)
+            )
+
+
+def harvest_vault_files(conn: sqlite3.Connection, vault_root: Path,
+                        dry_run: bool = False, force: bool = False,
+                        since: str = None) -> dict:
+    """Index all markdown files in the Obsidian vault into FTS5.
+
+    Walks the vault, reads each .md file, extracts frontmatter and title,
+    classifies domain from path, and inserts into vault_files + fts_unified.
+    Incremental by default — skips files whose SHA-256 hash hasn't changed.
+    """
+    stats = {"indexed": 0, "skipped": 0, "updated": 0, "errors": 0}
+
+    # Exclusion patterns
+    exclude_dirs = {
+        "node_modules", ".obsidian", "99 - Archive", ".trash",
+        ".git", ".claude", "Xnapper",
+    }
+
+    # Collect all .md files
+    md_files = []
+    for root, dirs, files in os.walk(vault_root):
+        # Prune excluded directories
+        dirs[:] = [d for d in dirs if d not in exclude_dirs]
+        for fname in files:
+            if fname.endswith(".md"):
+                md_files.append(Path(root) / fname)
+
+    # Filter by since date if provided
+    if since:
+        cutoff_ts = datetime.strptime(since, "%Y-%m-%d").timestamp()
+        md_files = [f for f in md_files if f.stat().st_mtime >= cutoff_ts]
+
+    total = len(md_files)
+    print(f"  Vault: {total} markdown files to process")
+
+    for i, md_path in enumerate(md_files, 1):
+        try:
+            fsize = md_path.stat().st_size
+            fmtime = datetime.fromtimestamp(
+                md_path.stat().st_mtime, tz=timezone.utc
+            ).isoformat()
+
+            # Skip very large files (>500KB — likely generated/data)
+            if fsize > 512_000:
+                stats["skipped"] += 1
+                continue
+
+            # Read content
+            try:
+                content = md_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                stats["errors"] += 1
+                continue
+
+            # Hash for change detection
+            fhash = hashlib.sha256(content.encode()).hexdigest()
+
+            # Check if already indexed with same hash
+            if not force:
+                existing = conn.execute(
+                    "SELECT file_hash FROM vault_files WHERE file_path = ?",
+                    (str(md_path),)
+                ).fetchone()
+                if existing and existing[0] == fhash:
+                    stats["skipped"] += 1
+                    continue
+
+            if dry_run:
+                stats["skipped"] += 1
+                continue
+
+            # Extract vault-relative path
+            vrel = str(md_path).replace(str(vault_root) + "/", "")
+
+            # Classify domain from path
+            domain = classify_domain_from_path(str(md_path))
+
+            # Extract title (first # heading or filename)
+            title = md_path.stem
+            for line in content.split("\n")[:20]:
+                if line.startswith("# ") and not line.startswith("# ---"):
+                    title = line[2:].strip()
+                    break
+
+            # Extract frontmatter (everything between first --- and second ---)
+            frontmatter = None
+            if content.startswith("---"):
+                end = content.find("---", 3)
+                if end > 0:
+                    frontmatter = content[3:end].strip()
+            # Also handle field:: value style (no --- delimiters)
+            elif content and "::" in content.split("\n")[0]:
+                fm_lines = []
+                for line in content.split("\n"):
+                    if "::" in line:
+                        fm_lines.append(line)
+                    elif line.strip() == "" and fm_lines:
+                        break
+                    elif line.startswith("#"):
+                        break
+                    else:
+                        break
+                if fm_lines:
+                    frontmatter = "\n".join(fm_lines)
+
+            # Word count
+            words = len(content.split())
+
+            # File creation time
+            try:
+                created_at = datetime.fromtimestamp(
+                    md_path.stat().st_birthtime, tz=timezone.utc
+                ).isoformat()
+            except (AttributeError, OSError):
+                created_at = fmtime
+
+            # Upsert into vault_files
+            # Need to handle the FTS triggers properly for updates
+            existing_row = conn.execute(
+                "SELECT id FROM vault_files WHERE file_path = ?",
+                (str(md_path),)
+            ).fetchone()
+
+            if existing_row:
+                # Update existing — triggers handle FTS sync
+                conn.execute(
+                    """UPDATE vault_files SET
+                        vault_relative = ?, domain = ?, title = ?,
+                        frontmatter = ?, content_text = ?,
+                        char_count = ?, word_count = ?,
+                        file_hash = ?, file_mtime = ?, file_size = ?,
+                        harvested_at = ?, harvest_version = ?
+                       WHERE file_path = ?""",
+                    (vrel, domain, title, frontmatter, content,
+                     len(content), words, fhash, fmtime, fsize,
+                     datetime.now(timezone.utc).isoformat(), SCHEMA_VERSION,
+                     str(md_path))
+                )
+                stats["updated"] += 1
+            else:
+                # Insert new
+                conn.execute(
+                    """INSERT INTO vault_files
+                       (file_path, vault_relative, domain, title,
+                        frontmatter, content_text, char_count, word_count,
+                        file_hash, file_mtime, file_size, created_at,
+                        harvested_at, harvest_version)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (str(md_path), vrel, domain, title,
+                     frontmatter, content, len(content), words,
+                     fhash, fmtime, fsize, created_at,
+                     datetime.now(timezone.utc).isoformat(), SCHEMA_VERSION)
+                )
+                stats["indexed"] += 1
+
+            # Commit in batches
+            if i % 100 == 0:
+                conn.commit()
+                pct = int(i / total * 100)
+                sys.stdout.write(f"\r  [{pct:3d}%] {i}/{total} — {stats['indexed']} new, {stats['updated']} updated, {stats['skipped']} unchanged")
+                sys.stdout.flush()
+
+        except Exception as e:
+            stats["errors"] += 1
+            if stats["errors"] <= 5:
+                print(f"\n  ERROR: {md_path.name}: {e}")
+
+    conn.commit()
+    print(f"\r  [100%] {total}/{total} — {stats['indexed']} new, {stats['updated']} updated, {stats['skipped']} unchanged")
+
+    return stats
+
+
+def cmd_harvest(args):
+    """Ingest JSONL transcripts and vault files into the database."""
+    conn = get_db()
+
+    # Ensure schema exists
+    conn.executescript(SCHEMA_SQL)
+    conn.executescript(SEED_PRICING_SQL)
+    conn.commit()
+
+    source = args.source
+
+    # ── JSONL Transcripts ──
+    if source in ("claude-code", "all"):
+        if args.session:
+            jsonl_files = [PROJECTS_DIR / f"{args.session}.jsonl"]
+            jsonl_files = [f for f in jsonl_files if f.exists()]
+        else:
+            jsonl_files = sorted(
+                [f for f in PROJECTS_DIR.iterdir() if f.suffix == ".jsonl" and f.is_file()],
+                key=lambda p: p.stat().st_mtime
+            )
+
+        if args.since:
+            cutoff = datetime.strptime(args.since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            jsonl_files = [
+                f for f in jsonl_files
+                if datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc) >= cutoff
+            ]
+
+        total = len(jsonl_files)
+        harvested = 0
+        skipped = 0
+        total_msgs = 0
+        total_tools = 0
+        errors = 0
+
+        print(f"[transcripts] {total} JSONL file(s)")
+
+        for i, jf in enumerate(jsonl_files, 1):
+            try:
+                result = harvest_jsonl(conn, jf, dry_run=args.dry_run, force=args.full)
+                if result["skipped"]:
+                    skipped += 1
+                else:
+                    harvested += 1
+                    total_msgs += result["messages"]
+                    total_tools += result["tool_uses"]
+                    errors += result["errors"]
+                    conn.commit()
+
+                if i % 10 == 0 or i == total:
+                    pct = int(i / total * 100)
+                    sys.stdout.write(f"\r  [{pct:3d}%] {i}/{total} — {harvested} harvested, {skipped} skipped")
+                    sys.stdout.flush()
+
+            except Exception as e:
+                errors += 1
+                print(f"\n  ERROR: {jf.name}: {e}")
+                conn.execute(
+                    "INSERT OR REPLACE INTO harvest_log (file_path, file_hash, file_size, harvested_at, status, error_text, harvest_version) VALUES (?, '', 0, ?, 'error', ?, ?)",
+                    (str(jf), datetime.now(timezone.utc).isoformat(), str(e), SCHEMA_VERSION)
+                )
+                conn.commit()
+
+        print()
+
+        if harvested > 0 and not args.dry_run:
+            print("  Building concurrency groups...")
+            build_concurrency_groups(conn)
+            conn.commit()
+
+        print(f"  Transcripts: {harvested} harvested, {skipped} unchanged, {errors} errors")
+        print(f"  Messages: {total_msgs:,} | Tool uses: {total_tools:,}")
+
+    # ── Vault Files ──
+    if source in ("vault", "all"):
+        print(f"\n[vault] Indexing Obsidian vault...")
+        vault_stats = harvest_vault_files(
+            conn, VAULT_ROOT,
+            dry_run=args.dry_run,
+            force=args.full,
+            since=args.since,
+        )
+        print(f"  Vault: {vault_stats['indexed']} new, {vault_stats['updated']} updated, "
+              f"{vault_stats['skipped']} unchanged, {vault_stats['errors']} errors")
+
+    # Final summary
+    db_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+    vault_count = conn.execute("SELECT COUNT(*) FROM vault_files").fetchone()[0]
+    session_count = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    print(f"\n  DB: {db_size / 1024 / 1024:.1f} MB | {session_count} sessions | {msg_count:,} messages | {vault_count:,} vault files")
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Search command
+# ---------------------------------------------------------------------------
+
+
+def cmd_search(args):
+    """Full-text search across all session content."""
+    conn = get_db()
+    query = args.query
+
+    limit = args.limit or 20
+
+    sql = """
+        SELECT
+            fu.source_type,
+            fu.session_uuid,
+            fu.domain,
+            fu.timestamp,
+            snippet(fts_unified, 4, '>>>', '<<<', '...', 40) AS snippet,
+            rank
+        FROM fts_unified fu
+        WHERE fts_unified MATCH ?
+    """
+    params = [query]
+
+    if args.domain:
+        sql += " AND fu.domain = ?"
+        params.append(args.domain)
+
+    if args.since:
+        sql += " AND fu.timestamp >= ?"
+        params.append(args.since)
+
+    sql += " ORDER BY rank LIMIT ?"
+    params.append(limit)
+
+    rows = conn.execute(sql, params).fetchall()
+
+    if not rows:
+        print(f"No results for: {query}")
+        conn.close()
+        return
+
+    if args.format == "json":
+        results = [dict(r) for r in rows]
+        print(json.dumps(results, indent=2))
+    else:
+        print(f"\n  {len(rows)} result(s) for: {query}\n")
+        for r in rows:
+            domain = r["domain"] or "?"
+            src = r["source_type"]
+            ts = r["timestamp"][:10] if r["timestamp"] else "?"
+            snippet = r["snippet"]
+            uuid_short = r["session_uuid"][:8] if r["session_uuid"] else "?"
+            print(f"  [{domain}] {ts} ({src}) [{uuid_short}]")
+            print(f"    {snippet}")
+            print()
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Sessions command
+# ---------------------------------------------------------------------------
+
+
+def cmd_sessions(args):
+    """List or show sessions."""
+    conn = get_db()
+
+    if args.subcmd == "show" and args.uuid:
+        # Show single session
+        row = conn.execute(
+            "SELECT * FROM v_recent_sessions WHERE session_uuid LIKE ?",
+            (f"{args.uuid}%",)
+        ).fetchone()
+
+        if not row:
+            print(f"No session found matching: {args.uuid}")
+            conn.close()
+            return
+
+        print(f"\nSession: {row['session_uuid']}")
+        print(f"  Domain:    {row['primary_domain'] or '?'} ({row['domains'] or '?'})")
+        print(f"  Started:   {row['started_at']}")
+        print(f"  Duration:  {row['duration_min'] or '?'} min")
+        print(f"  Model:     {row['primary_model'] or '?'}")
+        print(f"  Messages:  {row['message_count']} ({row['tool_use_count']} tool calls)")
+        print(f"  Tokens:    {row['total_input_tokens']:,} in / {row['total_output_tokens']:,} out")
+        print(f"  Cost:      ${row['estimated_cost_usd']:.2f}")
+        print(f"  Compacts:  {row['compact_count']}")
+        print(f"  Subagents: {row['subagent_count']}")
+        if row['first_prompt']:
+            print(f"  Prompt:    {row['first_prompt'][:100]}...")
+        if row['summary']:
+            print(f"  Summary:   {row['summary'][:200]}...")
+
+        # Show file operations
+        files = conn.execute(
+            "SELECT vault_relative, operation, operation_count FROM file_operations WHERE session_id = ? ORDER BY first_at",
+            (row['id'],)
+        ).fetchall()
+        if files:
+            print(f"\n  Files touched ({len(files)}):")
+            for f in files[:20]:
+                print(f"    {f['operation']:5s}  {f['vault_relative'] or '?'} (x{f['operation_count']})")
+            if len(files) > 20:
+                print(f"    ... and {len(files) - 20} more")
+
+        # Show subagents
+        agents = conn.execute(
+            "SELECT slug, model, message_count, tool_use_count FROM subagents WHERE session_id = ?",
+            (row['id'],)
+        ).fetchall()
+        if agents:
+            print(f"\n  Subagents ({len(agents)}):")
+            for a in agents:
+                print(f"    {a['slug'] or '?'} ({a['model'] or '?'}) — {a['message_count']} msgs, {a['tool_use_count']} tools")
+
+    elif args.subcmd == "concurrent":
+        # Show concurrent session groups
+        groups = conn.execute(
+            """SELECT cg.*, GROUP_CONCAT(s.session_uuid || ' (' || COALESCE(s.primary_domain, '?') || ')', ' | ') AS members
+               FROM concurrency_groups cg
+               JOIN sessions s ON s.concurrency_group_id = cg.id
+               GROUP BY cg.id ORDER BY cg.started_at DESC LIMIT ?""",
+            (args.limit or 10,)
+        ).fetchall()
+
+        if not groups:
+            print("No concurrent session groups found.")
+        else:
+            print(f"\n  Concurrent session groups:\n")
+            for g in groups:
+                print(f"  [{g['domains'] or '?'}] {g['started_at'][:16]} — {g['session_count']} sessions")
+                for member in g['members'].split(' | '):
+                    print(f"    {member}")
+                print()
+
+    else:
+        # List sessions
+        limit = args.limit or 20
+        sql = "SELECT * FROM v_recent_sessions"
+        params = []
+        wheres = []
+
+        if args.domain:
+            wheres.append("primary_domain = ?")
+            params.append(args.domain)
+        if args.since:
+            wheres.append("started_at >= ?")
+            params.append(args.since)
+
+        if wheres:
+            sql += " WHERE " + " AND ".join(wheres)
+
+        sql += f" LIMIT ?"
+        params.append(limit)
+
+        rows = conn.execute(sql, params).fetchall()
+
+        if args.format == "json":
+            print(json.dumps([dict(r) for r in rows], indent=2))
+        else:
+            print(f"\n  {'UUID':8s}  {'Domain':6s}  {'Date':10s}  {'Min':>4s}  {'Msgs':>5s}  {'Tools':>5s}  {'Cost':>7s}  Prompt")
+            print(f"  {'─'*8}  {'─'*6}  {'─'*10}  {'─'*4}  {'─'*5}  {'─'*5}  {'─'*7}  {'─'*40}")
+            for r in rows:
+                uuid = r["session_uuid"][:8]
+                domain = (r["primary_domain"] or "?")[:6]
+                date = r["started_at"][:10] if r["started_at"] else "?"
+                dur = str(r["duration_min"] or "?")
+                msgs = str(r["message_count"])
+                tools = str(r["tool_use_count"])
+                cost = f"${r['estimated_cost_usd']:.2f}" if r["estimated_cost_usd"] else "$0.00"
+                prompt = (r["first_prompt"] or "")[:40]
+                print(f"  {uuid}  {domain:6s}  {date}  {dur:>4s}  {msgs:>5s}  {tools:>5s}  {cost:>7s}  {prompt}")
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Files command
+# ---------------------------------------------------------------------------
+
+
+def cmd_files(args):
+    """Track file operations across sessions."""
+    conn = get_db()
+
+    if args.subcmd == "trail" and args.file:
+        # Show all sessions that touched a file
+        rows = conn.execute(
+            """SELECT fo.operation, fo.operation_count, fo.first_at, fo.last_at,
+                      s.session_uuid, s.primary_domain, s.first_prompt
+               FROM file_operations fo
+               JOIN sessions s ON s.id = fo.session_id
+               WHERE fo.vault_relative LIKE ?
+               ORDER BY fo.first_at DESC LIMIT ?""",
+            (f"%{args.file}%", args.limit or 20)
+        ).fetchall()
+
+        if not rows:
+            print(f"No sessions found touching: {args.file}")
+        else:
+            print(f"\n  Trail for: {args.file}\n")
+            for r in rows:
+                print(f"  {r['first_at'][:10]}  {r['operation']:5s}  [{r['primary_domain'] or '?'}]  {r['session_uuid'][:8]}  {(r['first_prompt'] or '')[:50]}")
+    else:
+        # Hot files
+        limit = args.limit or 20
+        rows = conn.execute(f"SELECT * FROM v_hot_files LIMIT ?", (limit,)).fetchall()
+
+        if not rows:
+            print("No file operations recorded.")
+        else:
+            print(f"\n  {'File':50s}  {'Domain':6s}  {'Sessions':>8s}  {'Reads':>5s}  {'Writes':>6s}  {'Edits':>5s}")
+            print(f"  {'─'*50}  {'─'*6}  {'─'*8}  {'─'*5}  {'─'*6}  {'─'*5}")
+            for r in rows:
+                vr = (r["vault_relative"] or "?")[:50]
+                print(f"  {vr:50s}  {(r['domain'] or '?'):6s}  {r['sessions_touched']:>8}  {r['reads']:>5}  {r['writes']:>6}  {r['edits']:>5}")
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Stats command
+# ---------------------------------------------------------------------------
+
+
+def cmd_stats(args):
+    """Usage statistics and cost reports."""
+    conn = get_db()
+
+    if args.subcmd == "daily":
+        rows = conn.execute(
+            "SELECT * FROM v_daily_activity LIMIT ?",
+            (args.limit or 14,)
+        ).fetchall()
+
+        if not rows:
+            print("No activity recorded.")
+        else:
+            print(f"\n  {'Day':10s}  {'Sessions':>8s}  {'Messages':>8s}  {'Tools':>6s}  {'Cost':>7s}  {'Hours':>5s}  Domains")
+            print(f"  {'─'*10}  {'─'*8}  {'─'*8}  {'─'*6}  {'─'*7}  {'─'*5}  {'─'*20}")
+            for r in rows:
+                print(f"  {r['day']}  {r['sessions']:>8}  {r['messages']:>8}  {r['tools']:>6}  ${r['cost_usd']:>6}  {r['hours']:>5}  {r['domains'] or '?'}")
+
+    elif args.subcmd == "domains":
+        rows = conn.execute("SELECT * FROM v_domain_summary").fetchall()
+
+        if not rows:
+            print("No domain data.")
+        else:
+            print(f"\n  {'Domain':12s}  {'Sessions':>8s}  {'Messages':>8s}  {'Tools':>6s}  {'Tokens Out':>10s}  {'Cost':>8s}  {'Hours':>6s}")
+            print(f"  {'─'*12}  {'─'*8}  {'─'*8}  {'─'*6}  {'─'*10}  {'─'*8}  {'─'*6}")
+            for r in rows:
+                print(f"  {r['domain']:12s}  {r['session_count']:>8}  {r['total_messages']:>8}  {r['total_tool_uses']:>6}  {r['total_output_tokens']:>10,}  ${r['total_cost_usd']:>7.2f}  {r['total_minutes'] or 0:>6}")
+
+    elif args.subcmd == "tools":
+        rows = conn.execute("SELECT * FROM v_tool_stats").fetchall()
+
+        if not rows:
+            print("No tool data.")
+        else:
+            print(f"\n  {'Tool':20s}  {'Invocations':>11s}  {'Sessions':>8s}  {'Errors':>6s}  {'Err%':>5s}")
+            print(f"  {'─'*20}  {'─'*11}  {'─'*8}  {'─'*6}  {'─'*5}")
+            for r in rows:
+                print(f"  {r['tool_name']:20s}  {r['invocations']:>11,}  {r['sessions_used']:>8}  {r['errors']:>6}  {r['error_pct']:>5.1f}")
+
+    elif args.subcmd == "models":
+        rows = conn.execute(
+            """SELECT model, COUNT(DISTINCT session_id) AS sessions,
+                      COUNT(*) AS messages,
+                      SUM(input_tokens) AS total_in,
+                      SUM(output_tokens) AS total_out
+               FROM messages WHERE model IS NOT NULL AND model != '<synthetic>'
+               GROUP BY model ORDER BY total_out DESC"""
+        ).fetchall()
+
+        if not rows:
+            print("No model data.")
+        else:
+            print(f"\n  {'Model':35s}  {'Sessions':>8s}  {'Messages':>8s}  {'Input':>10s}  {'Output':>10s}")
+            print(f"  {'─'*35}  {'─'*8}  {'─'*8}  {'─'*10}  {'─'*10}")
+            for r in rows:
+                print(f"  {r['model']:35s}  {r['sessions']:>8}  {r['messages']:>8}  {(r['total_in'] or 0):>10,}  {(r['total_out'] or 0):>10,}")
+
+    else:
+        # Overview
+        session_count = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        tool_count = conn.execute("SELECT COUNT(*) FROM tool_uses").fetchone()[0]
+        file_count = conn.execute("SELECT COUNT(DISTINCT file_path) FROM file_operations").fetchone()[0]
+        total_cost = conn.execute("SELECT COALESCE(SUM(estimated_cost_usd), 0) FROM sessions").fetchone()[0]
+        total_out = conn.execute("SELECT COALESCE(SUM(total_output_tokens), 0) FROM sessions").fetchone()[0]
+        total_in = conn.execute("SELECT COALESCE(SUM(total_input_tokens), 0) FROM sessions").fetchone()[0]
+        groups = conn.execute("SELECT COUNT(*) FROM concurrency_groups").fetchone()[0]
+        subagents = conn.execute("SELECT COUNT(*) FROM subagents").fetchone()[0]
+        compacts = conn.execute("SELECT COALESCE(SUM(compact_count), 0) FROM sessions").fetchone()[0]
+
+        # Vault file stats
+        try:
+            vault_count = conn.execute("SELECT COUNT(*) FROM vault_files").fetchone()[0]
+            vault_words = conn.execute("SELECT COALESCE(SUM(word_count), 0) FROM vault_files").fetchone()[0]
+        except sqlite3.OperationalError:
+            vault_count = 0
+            vault_words = 0
+
+        earliest = conn.execute("SELECT MIN(started_at) FROM sessions").fetchone()[0]
+        latest = conn.execute("SELECT MAX(started_at) FROM sessions").fetchone()[0]
+
+        db_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+
+        print(f"\n  Session Ledger — Overview")
+        print(f"  {'─'*40}")
+        print(f"  Sessions:          {session_count:,}")
+        print(f"  Messages:          {msg_count:,}")
+        print(f"  Tool invocations:  {tool_count:,}")
+        print(f"  Unique files:      {file_count:,}")
+        print(f"  Subagents:         {subagents:,}")
+        print(f"  Compactions:       {compacts:,}")
+        print(f"  Concurrency groups:{groups:,}")
+        print(f"  Vault files:       {vault_count:,} ({vault_words:,} words)")
+        print(f"  Input tokens:      {total_in:,}")
+        print(f"  Output tokens:     {total_out:,}")
+        print(f"  Estimated cost:    ${total_cost:,.2f}")
+        print(f"  Date range:        {(earliest or '?')[:10]} → {(latest or '?')[:10]}")
+        print(f"  Database size:     {db_size / 1024 / 1024:.1f} MB")
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Status command
+# ---------------------------------------------------------------------------
+
+
+def cmd_status(args):
+    """Database health and harvest status."""
+    conn = get_db()
+
+    db_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+    schema_v = conn.execute(
+        "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+    ).fetchone()
+    schema_v = schema_v[0] if schema_v else "?"
+
+    sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    messages = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    tools = conn.execute("SELECT COUNT(*) FROM tool_uses").fetchone()[0]
+
+    harvested = conn.execute(
+        "SELECT COUNT(*) FROM harvest_log WHERE status = 'complete'"
+    ).fetchone()[0]
+    errored = conn.execute(
+        "SELECT COUNT(*) FROM harvest_log WHERE status = 'error'"
+    ).fetchone()[0]
+    last_harvest = conn.execute(
+        "SELECT MAX(harvested_at) FROM harvest_log"
+    ).fetchone()[0]
+
+    # Count unharvested JSONL files
+    if PROJECTS_DIR.is_dir():
+        all_jsonl = [f for f in PROJECTS_DIR.iterdir() if f.suffix == ".jsonl" and f.is_file()]
+        total_jsonl = len(all_jsonl)
+        total_jsonl_size = sum(f.stat().st_size for f in all_jsonl)
+    else:
+        total_jsonl = 0
+        total_jsonl_size = 0
+
+    print(f"\n  Session Ledger — Status")
+    print(f"  {'─'*40}")
+    print(f"  DB path:       {DB_PATH}")
+    print(f"  DB size:       {db_size / 1024 / 1024:.1f} MB")
+    print(f"  Schema:        v{schema_v}")
+    print(f"  Sessions:      {sessions:,}")
+    print(f"  Messages:      {messages:,}")
+    print(f"  Tool uses:     {tools:,}")
+    print(f"  Harvested:     {harvested} files")
+    print(f"  Errors:        {errored} files")
+    print(f"  Last harvest:  {last_harvest or 'never'}")
+    print(f"  JSONL source:  {total_jsonl} files, {total_jsonl_size / 1024 / 1024:.1f} MB")
+    print(f"  Pending:       ~{total_jsonl - harvested} files")
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Query command
+# ---------------------------------------------------------------------------
+
+
+def cmd_query(args):
+    """Run arbitrary SQL against the database."""
+    conn = get_db()
+    sql = args.sql
+
+    try:
+        rows = conn.execute(sql).fetchall()
+        if not rows:
+            print("(no results)")
+            conn.close()
+            return
+
+        if args.format == "json":
+            print(json.dumps([dict(r) for r in rows], indent=2))
+        elif args.format == "csv":
+            keys = rows[0].keys()
+            print(",".join(keys))
+            for r in rows:
+                print(",".join(str(r[k]) for k in keys))
+        else:
+            # Table format
+            keys = rows[0].keys()
+            widths = {k: max(len(k), max(len(str(r[k] or "")[:50]) for r in rows)) for k in keys}
+            header = "  ".join(k.ljust(widths[k])[:50] for k in keys)
+            print(header)
+            print("  ".join("─" * min(widths[k], 50) for k in keys))
+            for r in rows:
+                line = "  ".join(str(r[k] or "")[:50].ljust(widths[k])[:50] for k in keys)
+                print(line)
+    except sqlite3.Error as e:
+        print(f"SQL error: {e}")
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ledger",
+        description="Session Ledger — Full-fidelity Claude session transcript database",
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    parser.add_argument("--db", type=Path, default=DB_PATH, help="Database path")
+    parser.add_argument("--format", choices=["table", "json", "csv"], default="table")
+
+    sub = parser.add_subparsers(dest="command")
+
+    # init
+    sub.add_parser("init", help="Create/migrate database schema")
+
+    # harvest
+    h = sub.add_parser("harvest", help="Ingest JSONL transcripts")
+    h.add_argument("--source", choices=["claude-code", "all"], default="claude-code")
+    h.add_argument("--full", action="store_true", help="Force re-harvest all files")
+    h.add_argument("--dry-run", action="store_true", help="Preview without writing")
+    h.add_argument("--since", help="Only files modified after YYYY-MM-DD")
+    h.add_argument("--session", help="Harvest specific session UUID")
+
+    # search
+    s = sub.add_parser("search", help="Full-text search")
+    s.add_argument("query", help="Search query")
+    s.add_argument("--domain", help="Filter by domain")
+    s.add_argument("--since", help="Results after YYYY-MM-DD")
+    s.add_argument("--limit", type=int, default=20)
+
+    # sessions
+    ss = sub.add_parser("sessions", help="List and inspect sessions")
+    ss.add_argument("subcmd", nargs="?", default="list", choices=["list", "show", "concurrent"])
+    ss.add_argument("uuid", nargs="?", help="Session UUID (for show)")
+    ss.add_argument("--domain", help="Filter by domain")
+    ss.add_argument("--since", help="Sessions after YYYY-MM-DD")
+    ss.add_argument("--limit", type=int, default=20)
+
+    # files
+    fs = sub.add_parser("files", help="File operation tracking")
+    fs.add_argument("subcmd", nargs="?", default="hot", choices=["hot", "trail"])
+    fs.add_argument("file", nargs="?", help="File path (for trail)")
+    fs.add_argument("--limit", type=int, default=20)
+
+    # stats
+    st = sub.add_parser("stats", help="Usage statistics")
+    st.add_argument("subcmd", nargs="?", default="overview",
+                     choices=["overview", "daily", "domains", "tools", "models"])
+    st.add_argument("--limit", type=int, default=14)
+
+    # status
+    sub.add_parser("status", help="Database health")
+
+    # query
+    q = sub.add_parser("query", help="Run SQL query")
+    q.add_argument("sql", help="SQL statement")
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    # Override DB path if specified
+    global DB_PATH
+    if args.db != DB_PATH:
+        DB_PATH = args.db
+
+    if args.command == "init":
+        cmd_init(args)
+    elif args.command == "harvest":
+        cmd_harvest(args)
+    elif args.command == "search":
+        cmd_search(args)
+    elif args.command == "sessions":
+        cmd_sessions(args)
+    elif args.command == "files":
+        cmd_files(args)
+    elif args.command == "stats":
+        cmd_stats(args)
+    elif args.command == "status":
+        cmd_status(args)
+    elif args.command == "query":
+        cmd_query(args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
