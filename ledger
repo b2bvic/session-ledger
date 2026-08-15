@@ -1467,11 +1467,13 @@ def cmd_harvest(args):
         if args.session:
             jsonl_files = [PROJECTS_DIR / f"{args.session}.jsonl"]
             jsonl_files = [f for f in jsonl_files if f.exists()]
-        else:
+        elif PROJECTS_DIR.is_dir():
             jsonl_files = sorted(
                 [f for f in PROJECTS_DIR.iterdir() if f.suffix == ".jsonl" and f.is_file()],
                 key=lambda p: p.stat().st_mtime
             )
+        else:
+            jsonl_files = []
 
         if args.since:
             cutoff = datetime.strptime(args.since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
