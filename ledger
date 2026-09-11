@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-session-ledger — Full-fidelity Claude session transcript database.
+session-ledger — Local Claude and Codex session transcript database.
 
-Harvests Claude Code JSONL transcripts into a SQLite database with FTS5
+Harvests local JSONL transcripts into a SQLite database with FTS5
 full-text search. Zero dependencies — stdlib only.
 
 Usage:
@@ -13,12 +13,15 @@ Usage:
     ledger files [hot|trail]        File operation tracking
     ledger stats [overview|daily]   Usage statistics
     ledger status                   Database health
+    ledger export [opts]            JSON export of shared records
     ledger query <sql>              Raw SQL access
 
 Config via environment:
     LEDGER_DB       Database path (default: ~/.claude/session-ledger.db)
     LEDGER_CLAUDE   Claude config dir (default: ~/.claude)
-    LEDGER_PROJECT  Project dir for session discovery (auto-detected)
+    LEDGER_PROJECT  Project dir for session discovery (default: all projects)
+    LEDGER_CODEX    Codex root dir (default: ~/.codex)
+    LEDGER_VAULT    Obsidian vault root (unset means vault harvest is unavailable)
 
 🌐 Victor Valentine Romo · victorvalentineromo.com · scalewithsearch.com
 """
@@ -40,34 +43,95 @@ from zoneinfo import ZoneInfo
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "1.0.0"
-SCHEMA_VERSION = 1
+VERSION = "0.2.0"
+SCHEMA_VERSION = 2
 
 # Timezone — override with LEDGER_TZ env var
 TZ_NAME = os.environ.get("LEDGER_TZ", "America/New_York")
 ET = ZoneInfo(TZ_NAME)
 
-# Paths — all configurable via environment
-CLAUDE_DIR = Path(os.environ.get("LEDGER_CLAUDE", str(Path.home() / ".claude")))
-DB_PATH = Path(os.environ.get("LEDGER_DB", str(CLAUDE_DIR / "session-ledger.db")))
-USAGE_META_DIR = CLAUDE_DIR / "usage-data" / "session-meta"
-USAGE_FACETS_DIR = CLAUDE_DIR / "usage-data" / "facets"
+SESSION_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 
-# Auto-detect project dir: find the first project in ~/.claude/projects/
+# Paths — all configurable via environment. Prefer the get_* helpers in
+# command handlers so tests can override env after import.
+def get_claude_dir() -> Path:
+    return Path(os.environ.get("LEDGER_CLAUDE", str(Path.home() / ".claude")))
+
+
+def get_codex_dir() -> Path:
+    return Path(os.environ.get("LEDGER_CODEX", str(Path.home() / ".codex")))
+
+
+def get_vault_root() -> "Path | None":
+    raw = os.environ.get("LEDGER_VAULT")
+    if raw:
+        return Path(raw)
+    return None
+
+
+def get_db_path() -> Path:
+    return Path(os.environ.get("LEDGER_DB", str(get_claude_dir() / "session-ledger.db")))
+
+
+def get_usage_meta_dir() -> Path:
+    return get_claude_dir() / "usage-data" / "session-meta"
+
+
+def get_usage_facets_dir() -> Path:
+    return get_claude_dir() / "usage-data" / "facets"
+
+
+def get_claude_projects_root() -> Path:
+    return get_claude_dir() / "projects"
+
+
+def _path_exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
+def _path_is_dir(path: Path) -> bool:
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
 def _find_project_dir():
-    projects = CLAUDE_DIR / "projects"
+    """Return LEDGER_PROJECT, else the newest Claude project, else the projects root.
+
+    Harvest no longer uses this as the sole discovery path. Default harvest
+    walks every project directory. This helper remains for status fallbacks
+    and import-time compatibility.
+    """
+    projects = get_claude_projects_root()
     override = os.environ.get("LEDGER_PROJECT")
     if override:
         return Path(override)
-    if projects.exists():
+    try:
+        if not _path_is_dir(projects):
+            return projects
         dirs = sorted(projects.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
         for d in dirs:
             if d.is_dir() and not d.name.startswith("."):
                 return d
+    except OSError:
+        return projects
     return projects
 
+
+CLAUDE_DIR = get_claude_dir()
+DB_PATH = get_db_path()
+USAGE_META_DIR = get_usage_meta_dir()
+USAGE_FACETS_DIR = get_usage_facets_dir()
 PROJECTS_DIR = _find_project_dir()
 SESSIONS_INDEX = PROJECTS_DIR / "sessions-index.json"
+VAULT_ROOT = get_vault_root()
 
 # Domain classification — customize by creating ~/.config/ledger/domains.json
 # Format: {"domain_name": ["keyword1", "keyword2", ...]}
@@ -79,11 +143,11 @@ DOMAIN_KEYWORDS = {
 
 # Try to load user-defined domains
 _domains_file = Path.home() / ".config" / "ledger" / "domains.json"
-if _domains_file.exists():
-    try:
+try:
+    if _domains_file.exists():
         DOMAIN_KEYWORDS = json.loads(_domains_file.read_text())
-    except (json.JSONDecodeError, KeyError):
-        pass
+except (json.JSONDecodeError, KeyError, OSError):
+    pass
 
 # Domain names for schema
 _domain_names = list(DOMAIN_KEYWORDS.keys())
@@ -113,8 +177,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     id              INTEGER PRIMARY KEY,
     session_uuid    TEXT NOT NULL,
     source          TEXT NOT NULL,
+    provider        TEXT,
+    native_session_id TEXT,
+    parent_id       TEXT,
     project_path    TEXT,
     jsonl_path      TEXT,
+    source_path     TEXT,
     vault_file      TEXT,
 
     started_at      TEXT NOT NULL,
@@ -163,6 +231,7 @@ CREATE TABLE IF NOT EXISTS messages (
     id              INTEGER PRIMARY KEY,
     session_id      INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     uuid            TEXT,
+    native_id       TEXT,
     parent_uuid     TEXT,
     timestamp       TEXT NOT NULL,
 
@@ -191,7 +260,8 @@ CREATE TABLE IF NOT EXISTS messages (
     sequence_num    INTEGER NOT NULL,
 
     agent_id        TEXT,
-    agent_slug      TEXT
+    agent_slug      TEXT,
+    source_path     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tool_uses (
@@ -199,6 +269,7 @@ CREATE TABLE IF NOT EXISTS tool_uses (
     message_id      INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
     session_id      INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     tool_use_id     TEXT NOT NULL,
+    native_id       TEXT,
     tool_name       TEXT NOT NULL,
     input_json      TEXT,
     timestamp       TEXT NOT NULL,
@@ -270,6 +341,8 @@ CREATE TABLE IF NOT EXISTS harvest_log (
     file_size       INTEGER,
     file_mtime      TEXT,
     session_uuid    TEXT,
+    provider        TEXT,
+    source_path     TEXT,
     harvested_at    TEXT NOT NULL,
     line_count      INTEGER,
     message_count   INTEGER,
@@ -303,6 +376,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_uuid ON sessions(session_uuid);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_domain ON sessions(primary_domain);
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
+CREATE INDEX IF NOT EXISTS idx_sessions_provider ON sessions(provider);
+CREATE INDEX IF NOT EXISTS idx_sessions_native ON sessions(native_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_group ON sessions(concurrency_group_id);
 
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, sequence_num);
@@ -438,11 +513,16 @@ BEGIN
 END;
 
 -- Views
+DROP VIEW IF EXISTS v_recent_sessions;
 CREATE VIEW IF NOT EXISTS v_recent_sessions AS
 SELECT
     s.id,
     s.session_uuid,
     s.source,
+    s.provider,
+    s.native_session_id,
+    s.parent_id,
+    s.source_path,
     s.started_at,
     s.ended_at,
     CAST(s.duration_ms / 60000.0 AS INTEGER) AS duration_min,
@@ -531,13 +611,90 @@ VALUES
 # ---------------------------------------------------------------------------
 
 
-def get_db(db_path: Path = DB_PATH) -> sqlite3.Connection:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path), timeout=10)
+def get_db(db_path: Path = None) -> sqlite3.Connection:
+    path = db_path or DB_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), timeout=10)
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.row_factory = sqlite3.Row
+    try:
+        has_meta = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta'"
+        ).fetchone()
+        if has_meta:
+            ensure_schema(conn)
+    except sqlite3.Error:
+        pass
     return conn
+
+
+ADDITIVE_COLUMNS = (
+    ("sessions", "provider", "TEXT"),
+    ("sessions", "native_session_id", "TEXT"),
+    ("sessions", "parent_id", "TEXT"),
+    ("sessions", "source_path", "TEXT"),
+    ("messages", "native_id", "TEXT"),
+    ("messages", "source_path", "TEXT"),
+    ("tool_uses", "native_id", "TEXT"),
+    ("harvest_log", "provider", "TEXT"),
+    ("harvest_log", "source_path", "TEXT"),
+)
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {r[1] for r in rows}
+
+
+def migrate_schema(conn: sqlite3.Connection):
+    """Apply additive schema changes without rebuilding existing tables."""
+    for table, column, col_type in ADDITIVE_COLUMNS:
+        try:
+            existing = _table_columns(conn, table)
+        except sqlite3.Error:
+            continue
+        if not existing or column in existing:
+            continue
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+
+    if "sessions" in {
+        r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }:
+        conn.execute(
+            "UPDATE sessions SET provider = source WHERE provider IS NULL AND source IS NOT NULL"
+        )
+        conn.execute(
+            "UPDATE sessions SET native_session_id = session_uuid "
+            "WHERE native_session_id IS NULL AND session_uuid IS NOT NULL"
+        )
+        conn.execute(
+            "UPDATE sessions SET source_path = jsonl_path "
+            "WHERE source_path IS NULL AND jsonl_path IS NOT NULL"
+        )
+        conn.execute(
+            "UPDATE messages SET native_id = uuid WHERE native_id IS NULL AND uuid IS NOT NULL"
+        )
+        conn.execute(
+            "UPDATE tool_uses SET native_id = tool_use_id "
+            "WHERE native_id IS NULL AND tool_use_id IS NOT NULL"
+        )
+
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+        ("schema_version", str(SCHEMA_VERSION)),
+    )
+
+
+def ensure_schema(conn: sqlite3.Connection):
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'").fetchone():
+        migrate_schema(conn)
+    conn.executescript(SCHEMA_SQL)
+    conn.executescript(SEED_PRICING_SQL)
+    migrate_schema(conn)
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -549,12 +706,7 @@ def cmd_init(args):
     """Create or migrate the database schema."""
     conn = get_db()
     try:
-        conn.executescript(SCHEMA_SQL)
-        conn.executescript(SEED_PRICING_SQL)
-        conn.execute(
-            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
-            ("schema_version", str(SCHEMA_VERSION)),
-        )
+        ensure_schema(conn)
         conn.execute(
             "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
             ("created_at", datetime.now(timezone.utc).isoformat()),
@@ -606,8 +758,8 @@ def extract_text_content(content) -> "str | None":
         for block in content:
             if not isinstance(block, dict):
                 continue
-            if block.get("type") == "text":
-                t = block.get("text", "").strip()
+            if block.get("type") in ("text", "input_text", "output_text"):
+                t = (block.get("text") or "").strip()
                 if t:
                     texts.append(t)
         return "\n\n".join(texts) if texts else None
@@ -688,10 +840,197 @@ def vault_relative_path(filepath: str) -> "str | None":
     """Convert absolute path to vault-relative path."""
     if not filepath:
         return None
-    vault_str = str(VAULT_ROOT) + "/"
+    root = get_vault_root()
+    if root is None:
+        return None
+    vault_str = str(root) + "/"
     if filepath.startswith(vault_str):
         return filepath[len(vault_str):]
     return None
+
+
+def qualify_id(provider: str, native_id) -> "str | None":
+    """Return a stored identity. Claude IDs stay unqualified. Codex IDs get a prefix."""
+    if native_id is None:
+        return None
+    native = str(native_id).strip()
+    if not native:
+        return None
+    if provider in (None, "", "claude-code"):
+        return native
+    prefix = f"{provider}:"
+    if native.startswith(prefix):
+        return native
+    return prefix + native
+
+
+def load_jsonl_records(jsonl_path: Path) -> tuple:
+    records = []
+    errors = 0
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                value = json.loads(stripped)
+                if not isinstance(value, dict):
+                    errors += 1
+                else:
+                    records.append(value)
+            except json.JSONDecodeError:
+                errors += 1
+    return records, errors
+
+
+def detect_transcript_format(records: list) -> str:
+    """Return claude-code, codex, or unknown from native record types."""
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        rtype = rec.get("type")
+        if rtype in ("session_meta", "response_item", "event_msg", "turn_context"):
+            return "codex"
+        if rtype in (
+            "user",
+            "assistant",
+            "system",
+            "progress",
+            "file-history-snapshot",
+            "queue-operation",
+            "last-prompt",
+        ):
+            return "claude-code"
+    return "unknown"
+
+
+def extract_codex_session_id(records: list) -> "str | None":
+    """Read the source session UUID from session_meta. Do not use the rollout filename."""
+    for rec in records:
+        if not isinstance(rec, dict) or rec.get("type") != "session_meta":
+            continue
+        payload = rec.get("payload")
+        if not isinstance(payload, dict):
+            payload = rec
+        sid = payload.get("id") or payload.get("session_id")
+        if sid:
+            return str(sid)
+    return None
+
+
+def _payload(record: dict) -> dict:
+    payload = record.get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _norm_path(path) -> str:
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _root_status(name: str, path: Path, available: bool, reason: "str | None" = None) -> dict:
+    return {
+        "name": name,
+        "path": str(path),
+        "available": available,
+        "reason": reason,
+    }
+
+
+def discover_claude_project_dirs() -> tuple:
+    """Return (project_dirs, root_status). LEDGER_PROJECT limits discovery to one dir."""
+    override = os.environ.get("LEDGER_PROJECT")
+    if override:
+        path = Path(override)
+        if _path_is_dir(path):
+            return [path], _root_status("claude-project", path, True)
+        reason = "missing" if not _path_exists(path) else "not a directory"
+        return [], _root_status("claude-project", path, False, reason)
+
+    root = get_claude_projects_root()
+    if not _path_exists(root):
+        return [], _root_status("claude-projects", root, False, "missing")
+    if not _path_is_dir(root):
+        return [], _root_status("claude-projects", root, False, "not a directory")
+    dirs = sorted(
+        [d for d in root.iterdir() if d.is_dir() and not d.name.startswith(".")],
+        key=lambda p: p.name,
+    )
+    return dirs, _root_status("claude-projects", root, True)
+
+
+def discover_claude_session_files(project_dirs: list) -> list:
+    """Top-level *.jsonl files in each Claude project directory."""
+    found = []
+    for project_dir in project_dirs:
+        try:
+            entries = sorted(project_dir.iterdir(), key=lambda p: p.name)
+        except OSError as error:
+            raise OSError(f"Cannot discover project {project_dir}: {error}") from error
+        for entry in entries:
+            if entry.is_file() and entry.suffix == ".jsonl":
+                found.append({"path": entry, "project_path": project_dir, "kind": "session"})
+    return found
+
+
+def discover_codex_jsonl(codex_root: Path) -> tuple:
+    """Recursive JSONL under sessions/ and archived_sessions/ only."""
+    if not _path_exists(codex_root):
+        return [], _root_status("codex", codex_root, False, "missing")
+    if not _path_is_dir(codex_root):
+        return [], _root_status("codex", codex_root, False, "not a directory")
+
+    files = []
+    children = []
+    def fail(error):
+        raise error
+    for sub in ("sessions", "archived_sessions"):
+        folder = codex_root / sub
+        available = folder.is_dir()
+        children.append(_root_status(f"codex-{sub}", folder, available, None if available else "missing or not a directory"))
+        if not available:
+            continue
+        for parent, dirs, names in os.walk(folder, followlinks=False, onerror=fail):
+            dirs.sort()
+            files.extend(Path(parent) / name for name in sorted(names) if name.endswith(".jsonl"))
+    status = _root_status("codex", codex_root, True)
+    status["children"] = children
+    return files, status
+
+
+def discover_subagent_files(session_jsonl: Path) -> list:
+    """Nested agent JSONL under <session-uuid>/..., including deeper subagents."""
+    session_dir = session_jsonl.parent / session_jsonl.stem
+    if not session_dir.is_dir():
+        return []
+    found = []
+    def fail(error):
+        raise error
+    for parent, dirs, names in os.walk(session_dir, followlinks=False, onerror=fail):
+        dirs.sort()
+        found.extend(Path(parent) / name for name in sorted(names) if name.endswith(".jsonl"))
+    return found
+
+
+def _agent_id_from_subagent_path(path: Path) -> str:
+    match = re.match(r"agent-(.+)\.jsonl$", path.name)
+    if match:
+        return match.group(1)
+    return path.stem
+
+
+def empty_harvest_stats() -> dict:
+    return {
+        "messages": 0,
+        "tool_uses": 0,
+        "file_ops": 0,
+        "errors": 0,
+        "skipped": False,
+        "status": "ok",
+        "unknown_format": False,
+        "conflict": False,
+        "session_uuid": None,
+        "provider": None,
+    }
 
 
 def estimate_cost(model: str, input_tok: int, output_tok: int,
@@ -714,372 +1053,247 @@ def estimate_cost(model: str, input_tok: int, output_tok: int,
 # ---------------------------------------------------------------------------
 
 
-def harvest_jsonl(conn: sqlite3.Connection, jsonl_path: Path,
-                  dry_run: bool = False, force: bool = False) -> dict:
-    """Harvest a single JSONL transcript into the database.
+def _ts_or_now(timestamp) -> str:
+    return timestamp or ""  # Unknown source time stays unknown, never harvest time.
 
-    Returns dict with counts: messages, tool_uses, files, errors.
-    """
-    stats = {"messages": 0, "tool_uses": 0, "file_ops": 0, "errors": 0, "skipped": False}
 
-    # Check harvest log
-    fhash = file_sha256(jsonl_path)
-    fsize = jsonl_path.stat().st_size
-    fmtime = datetime.fromtimestamp(jsonl_path.stat().st_mtime, tz=timezone.utc).isoformat()
+def _clear_session_children(conn: sqlite3.Connection, session_id: int):
+    # Replace this session's search snapshot within the harvest savepoint.
+    conn.execute(
+        """DELETE FROM fts_unified
+           WHERE session_uuid = (SELECT session_uuid FROM sessions WHERE id = ?)
+             AND source_type IN ('user_message', 'assistant_message', 'system_message')""",
+        (session_id,),
+    )
+    conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+    conn.execute("DELETE FROM tool_uses WHERE session_id = ?", (session_id,))
+    conn.execute("DELETE FROM file_operations WHERE session_id = ?", (session_id,))
+    conn.execute("DELETE FROM compactions WHERE session_id = ?", (session_id,))
+    conn.execute("DELETE FROM subagents WHERE session_id = ?", (session_id,))
 
-    if not force:
-        existing = conn.execute(
-            "SELECT id FROM harvest_log WHERE file_path = ? AND file_hash = ?",
-            (str(jsonl_path), fhash)
-        ).fetchone()
-        if existing:
-            stats["skipped"] = True
-            return stats
 
-    if dry_run:
-        stats["skipped"] = True
-        return stats
-
-    # Extract session UUID from filename
-    stem = jsonl_path.stem
-    session_uuid = stem  # UUID is the filename
-
-    # Read all lines
-    lines = []
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        for line in f:
-            stripped = line.strip()
-            if stripped:
-                try:
-                    lines.append(json.loads(stripped))
-                except json.JSONDecodeError:
-                    stats["errors"] += 1
-
-    if not lines:
-        return stats
-
-    # Extract session metadata
-    first_ts = None
-    last_ts = None
-    models_seen = set()
-    version = None
-    first_prompt = None
-    domain_signals = []
-    total_input = 0
-    total_output = 0
-    total_cache_create = 0
-    total_cache_read = 0
-    user_count = 0
-    assistant_count = 0
-    tool_count = 0
-    compact_count = 0
-
-    # Pending tool_use → tool_result linkage
-    pending_tool_uses = {}  # tool_use_id → tool_uses.id
-
-    # Create or update session row
-    # Check if session already exists (re-harvest)
-    existing_session = conn.execute(
-        "SELECT id FROM sessions WHERE session_uuid = ? AND source = 'claude-code'",
-        (session_uuid,)
-    ).fetchone()
-
-    if existing_session:
-        session_id = existing_session["id"]
-        # Clear old data for re-harvest
-        conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-        conn.execute("DELETE FROM tool_uses WHERE session_id = ?", (session_id,))
-        conn.execute("DELETE FROM file_operations WHERE session_id = ?", (session_id,))
-        conn.execute("DELETE FROM compactions WHERE session_id = ?", (session_id,))
-    else:
-        # Insert placeholder session row
+def _open_session_row(
+    conn: sqlite3.Connection,
+    *,
+    session_uuid: str,
+    source: str,
+    provider: str,
+    native_session_id: str,
+    parent_id,
+    project_path,
+    jsonl_path: Path,
+    started_at: str,
+    raw_line_count: int,
+    existing,
+) -> int:
+    now = datetime.now(timezone.utc).isoformat()
+    project_str = str(project_path) if project_path else None
+    path_str = str(jsonl_path)
+    if existing:
+        session_id = existing["id"]
+        _clear_session_children(conn, session_id)
         conn.execute(
-            """INSERT INTO sessions (session_uuid, source, project_path, jsonl_path, started_at,
-               is_harvested, harvest_version, harvested_at, raw_line_count)
-               VALUES (?, 'claude-code', ?, ?, ?, 0, ?, ?, ?)""",
-            (session_uuid, str(PROJECTS_DIR), str(jsonl_path),
-             datetime.now(timezone.utc).isoformat(),
-             SCHEMA_VERSION, datetime.now(timezone.utc).isoformat(), len(lines))
+            """UPDATE sessions SET
+                 provider = ?, native_session_id = ?, parent_id = ?,
+                 project_path = ?, jsonl_path = ?, source_path = ?,
+                 is_harvested = 0, harvest_version = ?, harvested_at = ?,
+                 raw_line_count = ?
+               WHERE id = ?""",
+            (
+                provider,
+                native_session_id,
+                parent_id,
+                project_str,
+                path_str,
+                path_str,
+                SCHEMA_VERSION,
+                now,
+                raw_line_count,
+                session_id,
+            ),
         )
-        session_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        return session_id
+    conn.execute(
+        """INSERT INTO sessions (
+               session_uuid, source, provider, native_session_id, parent_id,
+               project_path, jsonl_path, source_path, started_at,
+               is_harvested, harvest_version, harvested_at, raw_line_count
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)""",
+        (
+            session_uuid,
+            source,
+            provider,
+            native_session_id,
+            parent_id,
+            project_str,
+            path_str,
+            path_str,
+            started_at,
+            SCHEMA_VERSION,
+            now,
+            raw_line_count,
+        ),
+    )
+    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-    # Process each JSONL line
-    file_ops_tracker = {}  # (file_path, operation) → {first_at, last_at, count}
 
-    for seq_num, record in enumerate(lines):
-        if not isinstance(record, dict):
-            continue
-        rtype = record.get("type")
-        timestamp = parse_timestamp(record.get("timestamp"))
+def _write_complete_harvest_log(
+    conn: sqlite3.Connection,
+    jsonl_path: Path,
+    fhash: str,
+    fsize: int,
+    fmtime: str,
+    session_uuid: str,
+    provider: str,
+    line_count: int,
+    message_count: int,
+):
+    conn.execute(
+        """INSERT OR REPLACE INTO harvest_log
+           (file_path, file_hash, file_size, file_mtime, session_uuid,
+            provider, source_path, harvested_at, line_count, message_count,
+            status, harvest_version)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'complete', ?)""",
+        (
+            str(jsonl_path),
+            fhash,
+            fsize,
+            fmtime,
+            session_uuid,
+            provider,
+            str(jsonl_path),
+            datetime.now(timezone.utc).isoformat(),
+            line_count,
+            message_count,
+            SCHEMA_VERSION,
+        ),
+    )
 
-        if timestamp:
-            if first_ts is None or timestamp < first_ts:
-                first_ts = timestamp
-            if last_ts is None or timestamp > last_ts:
-                last_ts = timestamp
 
-        if rtype == "user":
-            msg = record.get("message", {})
-            content = msg.get("content")
-            content_text = extract_text_content(content)
-            is_sidechain = 1 if record.get("isSidechain") else 0
+def _write_error_harvest_log(
+    conn: sqlite3.Connection,
+    jsonl_path: Path,
+    error_text: str,
+    session_uuid=None,
+    provider=None,
+    fhash: str = "",
+):
+    conn.execute(
+        """INSERT OR REPLACE INTO harvest_log
+           (file_path, file_hash, file_size, session_uuid, provider, source_path,
+            harvested_at, status, error_text, harvest_version)
+           VALUES (?, ?, 0, ?, ?, ?, ?, 'error', ?, ?)""",
+        (
+            str(jsonl_path),
+            fhash,
+            session_uuid,
+            provider,
+            str(jsonl_path),
+            datetime.now(timezone.utc).isoformat(),
+            error_text,
+            SCHEMA_VERSION,
+        ),
+    )
 
-            if record.get("version"):
-                version = record["version"]
 
-            # Check if this is a tool result
-            tool_results = extract_tool_results(content) if isinstance(content, list) else []
-
-            if tool_results:
-                # This is a tool result message
-                for tr in tool_results:
-                    conn.execute(
-                        """INSERT INTO messages (session_id, uuid, parent_uuid, timestamp,
-                           role, message_type, content_text, content_json, raw_json,
-                           is_sidechain, sequence_num)
-                           VALUES (?, ?, ?, ?, 'tool_result', 'user', ?, ?, ?, ?, ?)""",
-                        (session_id, record.get("uuid"), record.get("parentUuid"),
-                         timestamp or datetime.now(timezone.utc).isoformat(),
-                         tr["content"][:5000], json.dumps(content) if content else None,
-                         json.dumps(record),
-                         is_sidechain, seq_num)
-                    )
-                    msg_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-                    stats["messages"] += 1
-
-                    # Link tool result back to tool_use
-                    tuid = tr["tool_use_id"]
-                    if tuid in pending_tool_uses:
-                        conn.execute(
-                            "UPDATE tool_uses SET result_message_id = ?, result_text = ?, is_error = ? WHERE id = ?",
-                            (msg_id, tr["content"][:10000],
-                             1 if tr["is_error"] else 0,
-                             pending_tool_uses[tuid])
-                        )
-                        del pending_tool_uses[tuid]
-            else:
-                # Real user message
-                if not record.get("isMeta") and content_text and first_prompt is None:
-                    first_prompt = content_text[:500]
-                    domain_signals.append(content_text)
-
-                if not record.get("isMeta") and content_text:
-                    user_count += 1
-                    domain_signals.append(content_text)
-
-                conn.execute(
-                    """INSERT INTO messages (session_id, uuid, parent_uuid, timestamp,
-                       role, message_type, content_text, content_json, raw_json,
-                       is_sidechain, sequence_num)
-                       VALUES (?, ?, ?, ?, 'user', 'user', ?, ?, ?, ?, ?)""",
-                    (session_id, record.get("uuid"), record.get("parentUuid"),
-                     timestamp or datetime.now(timezone.utc).isoformat(),
-                     content_text,
-                     json.dumps(content) if isinstance(content, list) else None,
-                     json.dumps(record),
-                     is_sidechain, seq_num)
-                )
-                stats["messages"] += 1
-
-        elif rtype == "assistant":
-            msg = record.get("message", {})
-            content = msg.get("content", [])
-            content_text = extract_text_content(content)
-            model = msg.get("model")
-            usage = msg.get("usage", {})
-
-            if model and model != "<synthetic>":
-                models_seen.add(model)
-
-            # Token accounting
-            in_tok = usage.get("input_tokens", 0) or 0
-            out_tok = usage.get("output_tokens", 0) or 0
-            cc_tok = usage.get("cache_creation_input_tokens", 0) or 0
-            cr_tok = usage.get("cache_read_input_tokens", 0) or 0
-            total_input += in_tok
-            total_output += out_tok
-            total_cache_create += cc_tok
-            total_cache_read += cr_tok
-
-            assistant_count += 1
-
-            conn.execute(
-                """INSERT INTO messages (session_id, uuid, parent_uuid, timestamp,
-                   role, message_type, content_text, content_json, raw_json,
-                   model, request_id, stop_reason,
-                   input_tokens, output_tokens, cache_create_tokens, cache_read_tokens,
-                   is_sidechain, sequence_num)
-                   VALUES (?, ?, ?, ?, 'assistant', 'assistant', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (session_id, record.get("uuid"), record.get("parentUuid"),
-                 timestamp or datetime.now(timezone.utc).isoformat(),
-                 content_text,
-                 json.dumps(content) if isinstance(content, list) else None,
-                 json.dumps(record),
-                 model, msg.get("id"), msg.get("stop_reason"),
-                 in_tok, out_tok, cc_tok, cr_tok,
-                 1 if record.get("isSidechain") else 0, seq_num)
-            )
-            msg_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-            stats["messages"] += 1
-
-            if content_text:
-                domain_signals.append(content_text)
-
-            # Extract tool uses
-            tool_uses = extract_tool_uses_from_content(content)
-            for tu in tool_uses:
-                tool_count += 1
-                conn.execute(
-                    """INSERT INTO tool_uses (message_id, session_id, tool_use_id, tool_name,
-                       input_json, timestamp, file_path, command, pattern, description)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (msg_id, session_id, tu["tool_use_id"], tu["tool_name"],
-                     json.dumps(tu["input"]),
-                     timestamp or datetime.now(timezone.utc).isoformat(),
-                     tu.get("file_path"), tu.get("command"),
-                     tu.get("pattern"), tu.get("description"))
-                )
-                tu_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-                pending_tool_uses[tu["tool_use_id"]] = tu_id
-                stats["tool_uses"] += 1
-
-                # Track file operations
-                fp = tu.get("file_path")
-                if fp:
-                    op_name = tu["tool_name"].lower()
-                    if op_name in ("read", "write", "edit", "glob", "grep"):
-                        key = (fp, op_name)
-                        ts_str = timestamp or datetime.now(timezone.utc).isoformat()
-                        if key in file_ops_tracker:
-                            file_ops_tracker[key]["last_at"] = ts_str
-                            file_ops_tracker[key]["count"] += 1
-                        else:
-                            file_ops_tracker[key] = {
-                                "first_at": ts_str,
-                                "last_at": ts_str,
-                                "count": 1,
-                            }
-
-        elif rtype == "system":
-            subtype = record.get("subtype")
-            content_text = None
-
-            if subtype == "compact_boundary":
-                compact_count += 1
-                summary_content = record.get("summary")
-                if isinstance(summary_content, list):
-                    summary_content = extract_text_content(summary_content)
-                elif isinstance(summary_content, str):
-                    pass
-                else:
-                    summary_content = None
-
-                conn.execute(
-                    """INSERT INTO messages (session_id, uuid, parent_uuid, timestamp,
-                       role, message_type, subtype, content_text, raw_json,
-                       is_compact_summary, sequence_num)
-                       VALUES (?, ?, ?, ?, 'system', 'system', ?, ?, ?, 1, ?)""",
-                    (session_id, record.get("uuid"), record.get("parentUuid"),
-                     timestamp or datetime.now(timezone.utc).isoformat(),
-                     subtype, summary_content, json.dumps(record), seq_num)
-                )
-
-                if summary_content:
-                    msg_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-                    conn.execute(
-                        "INSERT INTO compactions (session_id, message_id, pre_tokens, summary_text, timestamp) VALUES (?, ?, ?, ?, ?)",
-                        (session_id, msg_id, record.get("preTokens"),
-                         summary_content, timestamp or datetime.now(timezone.utc).isoformat())
-                    )
-            else:
-                conn.execute(
-                    """INSERT INTO messages (session_id, uuid, parent_uuid, timestamp,
-                       role, message_type, subtype, content_text, raw_json, sequence_num)
-                       VALUES (?, ?, ?, ?, 'system', 'system', ?, ?, ?, ?)""",
-                    (session_id, record.get("uuid"), record.get("parentUuid"),
-                     timestamp or datetime.now(timezone.utc).isoformat(),
-                     subtype, str(record.get("content", ""))[:1000],
-                     json.dumps(record), seq_num)
-                )
-            stats["messages"] += 1
-
-        # Skip progress, file-history-snapshot, queue-operation, last-prompt
-        # They're captured in raw_json of adjacent messages
-
-    # Insert file operations
+def _insert_file_ops(conn, session_id, file_ops_tracker, stats):
     for (fp, op), tracker in file_ops_tracker.items():
         vrel = vault_relative_path(fp)
         domain = classify_domain_from_path(fp)
         try:
             conn.execute(
                 """INSERT OR REPLACE INTO file_operations
-                   (session_id, file_path, operation, first_at, last_at, operation_count, vault_relative, domain)
+                   (session_id, file_path, operation, first_at, last_at,
+                    operation_count, vault_relative, domain)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (session_id, fp, op, tracker["first_at"], tracker["last_at"],
-                 tracker["count"], vrel, domain)
+                (
+                    session_id,
+                    fp,
+                    op,
+                    tracker["first_at"],
+                    tracker["last_at"],
+                    tracker["count"],
+                    vrel,
+                    domain,
+                ),
             )
             stats["file_ops"] += 1
         except sqlite3.Error:
             stats["errors"] += 1
 
-    # Classify domain
-    all_text = " ".join(domain_signals[:20])  # first 20 signals
-    text_domain = classify_domain_from_text(all_text)
 
-    # Also check file operations for domain signals
+def _track_file_op(file_ops_tracker, tool_name, file_path, timestamp):
+    if not file_path:
+        return
+    op_name = (tool_name or "").lower()
+    if op_name not in ("read", "write", "edit", "glob", "grep"):
+        return
+    key = (file_path, op_name)
+    ts_str = _ts_or_now(timestamp)
+    if key in file_ops_tracker:
+        file_ops_tracker[key]["last_at"] = ts_str
+        file_ops_tracker[key]["count"] += 1
+    else:
+        file_ops_tracker[key] = {"first_at": ts_str, "last_at": ts_str, "count": 1}
+
+
+def _classify_session_domain(domain_signals, file_ops_tracker):
+    all_text = " ".join(domain_signals[:20])
+    text_domain = classify_domain_from_text(all_text)
     path_domains = {}
     for (fp, _) in file_ops_tracker:
         d = classify_domain_from_path(fp)
         if d:
             path_domains[d] = path_domains.get(d, 0) + 1
-
     primary_domain = text_domain
     if path_domains:
         path_winner = max(path_domains, key=path_domains.get)
         if not primary_domain or path_domains[path_winner] > 3:
             primary_domain = path_winner
-
     all_domains = set()
     if text_domain:
         all_domains.add(text_domain)
     all_domains.update(path_domains.keys())
     domains_str = ",".join(sorted(all_domains)) if all_domains else None
+    return primary_domain, domains_str
 
-    # Compute duration
-    duration_ms = None
-    if first_ts and last_ts:
-        try:
-            dt_first = datetime.fromisoformat(first_ts)
-            dt_last = datetime.fromisoformat(last_ts)
-            duration_ms = int((dt_last - dt_first).total_seconds() * 1000)
-        except (ValueError, TypeError):
-            pass
 
-    # Determine primary model
-    primary_model = None
-    if models_seen:
-        # Prefer opus > sonnet > haiku
-        for m in ["claude-opus-4-6", "claude-sonnet-4-5-20250929", "claude-haiku-4-5-20251001"]:
-            if m in models_seen:
-                primary_model = m
-                break
-        if not primary_model:
-            primary_model = next(iter(models_seen))
+def _duration_ms(first_ts, last_ts):
+    if not first_ts or not last_ts:
+        return None
+    try:
+        dt_first = datetime.fromisoformat(first_ts)
+        dt_last = datetime.fromisoformat(last_ts)
+        return int((dt_last - dt_first).total_seconds() * 1000)
+    except (ValueError, TypeError):
+        return None
 
-    # Compute cost
-    total_cost = 0.0
-    if primary_model:
-        total_cost = estimate_cost(
-            primary_model, total_input, total_output,
-            total_cache_create, total_cache_read
-        )
 
-    # Load summary from sessions-index.json if available
+def _primary_model(models_seen):
+    if not models_seen:
+        return None
+    for m in [
+        "claude-opus-4-6",
+        "claude-sonnet-4-5-20250929",
+        "claude-haiku-4-5-20251001",
+    ]:
+        if m in models_seen:
+            return m
+    return next(iter(models_seen))
+
+
+def _load_claude_summary(project_path, session_uuid, first_prompt):
     summary = None
-    if SESSIONS_INDEX.exists():
+    index_path = None
+    if project_path:
+        candidate = Path(project_path) / "sessions-index.json"
+        if candidate.exists():
+            index_path = candidate
+    if index_path is None and SESSIONS_INDEX.exists():
+        index_path = SESSIONS_INDEX
+    if index_path is not None:
         try:
-            idx_raw = json.loads(SESSIONS_INDEX.read_text())
-            # sessions-index.json is a dict with {"version": 1, "entries": [...]}
+            idx_raw = json.loads(index_path.read_text())
             entries = []
             if isinstance(idx_raw, dict):
                 entries = idx_raw.get("entries", [])
@@ -1095,9 +1309,7 @@ def harvest_jsonl(conn: sqlite3.Connection, jsonl_path: Path,
                     break
         except (json.JSONDecodeError, OSError):
             pass
-
-    # Load enrichment from usage-data if available
-    meta_file = USAGE_META_DIR / f"{session_uuid}.json"
+    meta_file = get_usage_meta_dir() / f"{session_uuid}.json"
     if meta_file.exists():
         try:
             meta = json.loads(meta_file.read_text())
@@ -1107,71 +1319,36 @@ def harvest_jsonl(conn: sqlite3.Connection, jsonl_path: Path,
                 first_prompt = meta["first_prompt"]
         except (json.JSONDecodeError, OSError):
             pass
+    return summary, first_prompt
 
-    # Count subagents
-    subagent_dir = PROJECTS_DIR / session_uuid / "subagents"
-    subagent_count = 0
-    if subagent_dir.is_dir():
-        subagent_files = list(subagent_dir.glob("agent-*.jsonl"))
-        subagent_count = len(subagent_files)
-        for sa_file in subagent_files:
-            agent_id_match = re.match(r"agent-(.+)\.jsonl", sa_file.name)
-            agent_id = agent_id_match.group(1) if agent_id_match else sa_file.stem
-            try:
-                sa_lines = []
-                with open(sa_file) as f:
-                    for line in f:
-                        s = line.strip()
-                        if s:
-                            try:
-                                sa_lines.append(json.loads(s))
-                            except json.JSONDecodeError:
-                                pass
 
-                sa_slug = None
-                sa_model = None
-                sa_in = 0
-                sa_out = 0
-                sa_msgs = 0
-                sa_tools = 0
-                sa_first_ts = None
-                sa_last_ts = None
-
-                for sar in sa_lines:
-                    if sar.get("slug"):
-                        sa_slug = sar["slug"]
-                    ts = parse_timestamp(sar.get("timestamp"))
-                    if ts:
-                        if sa_first_ts is None or ts < sa_first_ts:
-                            sa_first_ts = ts
-                        if sa_last_ts is None or ts > sa_last_ts:
-                            sa_last_ts = ts
-                    if sar.get("type") in ("user", "assistant"):
-                        sa_msgs += 1
-                    if sar.get("type") == "assistant":
-                        msg = sar.get("message", {})
-                        if msg.get("model"):
-                            sa_model = msg["model"]
-                        usage = msg.get("usage", {})
-                        sa_in += usage.get("input_tokens", 0) or 0
-                        sa_out += usage.get("output_tokens", 0) or 0
-                        for block in (msg.get("content") or []):
-                            if isinstance(block, dict) and block.get("type") == "tool_use":
-                                sa_tools += 1
-
-                conn.execute(
-                    """INSERT OR REPLACE INTO subagents
-                       (session_id, agent_id, slug, model, jsonl_path,
-                        message_count, tool_use_count, input_tokens, output_tokens,
-                        started_at, ended_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (session_id, agent_id, sa_slug, sa_model, str(sa_file),
-                     sa_msgs, sa_tools, sa_in, sa_out, sa_first_ts, sa_last_ts)
-                )
-            except OSError:
-                pass
-
-    # Update session row with computed data
+def _finalize_session_row(
+    conn,
+    session_id,
+    *,
+    first_ts,
+    last_ts,
+    primary_domain,
+    domains_str,
+    summary,
+    primary_model,
+    models_seen,
+    version,
+    total_input,
+    total_output,
+    total_cache_create,
+    total_cache_read,
+    total_cost,
+    stats,
+    user_count,
+    assistant_count,
+    tool_count,
+    file_ops_tracker,
+    compact_count,
+    subagent_count,
+    first_prompt,
+    line_count,
+):
     conn.execute(
         """UPDATE sessions SET
             started_at = ?, ended_at = ?, duration_ms = ?,
@@ -1187,35 +1364,1156 @@ def harvest_jsonl(conn: sqlite3.Connection, jsonl_path: Path,
             subagent_count = ?, first_prompt = ?,
             is_harvested = 1, harvested_at = ?, raw_line_count = ?
            WHERE id = ?""",
-        (first_ts or datetime.now(timezone.utc).isoformat(),
-         last_ts, duration_ms,
-         primary_domain, domains_str, summary,
-         primary_model, ",".join(sorted(models_seen)) if models_seen else None,
-         version,
-         total_input, total_output, total_cache_create, total_cache_read,
-         total_cost,
-         stats["messages"], user_count, assistant_count, tool_count,
-         sum(1 for (_, op) in file_ops_tracker if op == "read"),
-         sum(1 for (_, op) in file_ops_tracker if op == "write"),
-         sum(1 for (_, op) in file_ops_tracker if op == "edit"),
-         compact_count,
-         subagent_count, first_prompt,
-         datetime.now(timezone.utc).isoformat(), len(lines),
-         session_id)
+        (
+            first_ts or "",
+            last_ts,
+            _duration_ms(first_ts, last_ts),
+            primary_domain,
+            domains_str,
+            summary,
+            primary_model,
+            ",".join(sorted(models_seen)) if models_seen else None,
+            version,
+            total_input,
+            total_output,
+            total_cache_create,
+            total_cache_read,
+            total_cost,
+            stats["messages"],
+            user_count,
+            assistant_count,
+            tool_count,
+            sum(1 for (_, op) in file_ops_tracker if op == "read"),
+            sum(1 for (_, op) in file_ops_tracker if op == "write"),
+            sum(1 for (_, op) in file_ops_tracker if op == "edit"),
+            compact_count,
+            subagent_count,
+            first_prompt,
+            datetime.now(timezone.utc).isoformat(),
+            line_count,
+            session_id,
+        ),
     )
 
-    # Record in harvest log
+
+def _insert_message(
+    conn,
+    *,
+    session_id,
+    uuid,
+    native_id,
+    parent_uuid,
+    timestamp,
+    role,
+    message_type,
+    content_text,
+    content_json,
+    raw_json,
+    sequence_num,
+    source_path,
+    subtype=None,
+    model=None,
+    request_id=None,
+    stop_reason=None,
+    input_tokens=None,
+    output_tokens=None,
+    cache_create_tokens=None,
+    cache_read_tokens=None,
+    is_sidechain=0,
+    is_compact_summary=0,
+    agent_id=None,
+    agent_slug=None,
+):
     conn.execute(
-        """INSERT OR REPLACE INTO harvest_log
-           (file_path, file_hash, file_size, file_mtime, session_uuid,
-            harvested_at, line_count, message_count, status, harvest_version)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'complete', ?)""",
-        (str(jsonl_path), fhash, fsize, fmtime, session_uuid,
-         datetime.now(timezone.utc).isoformat(), len(lines),
-         stats["messages"], SCHEMA_VERSION)
+        """INSERT INTO messages (
+               session_id, uuid, native_id, parent_uuid, timestamp,
+               role, message_type, subtype, content_text, content_json, raw_json,
+               model, request_id, stop_reason,
+               input_tokens, output_tokens, cache_create_tokens, cache_read_tokens,
+               is_sidechain, is_compact_summary, sequence_num,
+               agent_id, agent_slug, source_path
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            session_id,
+            uuid,
+            native_id,
+            parent_uuid,
+            timestamp,
+            role,
+            message_type,
+            subtype,
+            content_text,
+            content_json,
+            raw_json,
+            model,
+            request_id,
+            stop_reason,
+            input_tokens,
+            output_tokens,
+            cache_create_tokens,
+            cache_read_tokens,
+            is_sidechain,
+            is_compact_summary,
+            sequence_num,
+            agent_id,
+            agent_slug,
+            source_path,
+        ),
+    )
+    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def _insert_tool_use(
+    conn,
+    *,
+    message_id,
+    session_id,
+    tool_use_id,
+    native_id,
+    tool_name,
+    input_obj,
+    timestamp,
+    file_path,
+    command,
+    pattern,
+    description,
+):
+    conn.execute(
+        """INSERT INTO tool_uses (
+               message_id, session_id, tool_use_id, native_id, tool_name,
+               input_json, timestamp, file_path, command, pattern, description
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            message_id,
+            session_id,
+            tool_use_id,
+            native_id,
+            tool_name,
+            json.dumps(input_obj) if input_obj is not None else None,
+            timestamp,
+            file_path,
+            command,
+            pattern,
+            description,
+        ),
+    )
+    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def _parse_tool_arguments(arguments):
+    """Preserve source tool input. Parse JSON strings when the source stored JSON."""
+    if isinstance(arguments, str):
+        try:
+            return json.loads(arguments)
+        except json.JSONDecodeError:
+            return arguments
+    return arguments
+
+
+def _denormalize_tool_fields(inp):
+    file_path = command = pattern = description = None
+    if isinstance(inp, dict):
+        file_path = inp.get("file_path") or inp.get("path")
+        cmd = inp.get("command")
+        if isinstance(cmd, list):
+            command = " ".join(str(part) for part in cmd)
+        elif isinstance(cmd, str):
+            command = cmd
+        pattern = inp.get("pattern")
+        description = inp.get("description")
+    return file_path, command, pattern, description
+
+
+def harvest_jsonl(
+    conn: sqlite3.Connection,
+    jsonl_path: Path,
+    dry_run: bool = False,
+    force: bool = False,
+    project_path=None,
+    expected_provider=None,
+) -> dict:
+    """Harvest a single JSONL transcript into the database.
+
+    Parse and identify the file before mutating rows. Resume of the same
+    path is idempotent. A conflicting identity from a different path is
+    rejected. Malformed input rolls back this file and leaves prior state.
+    """
+    stats = empty_harvest_stats()
+    fhash = file_sha256(jsonl_path)
+    if expected_provider != "codex":
+        family = discover_subagent_files(jsonl_path)
+        if family:
+            digest = hashlib.sha256(fhash.encode())
+            for child in family:
+                digest.update(str(child.relative_to(jsonl_path.parent)).encode())
+                digest.update(file_sha256(child).encode())
+            fhash = digest.hexdigest()
+    fsize = jsonl_path.stat().st_size
+    fmtime = datetime.fromtimestamp(jsonl_path.stat().st_mtime, tz=timezone.utc).isoformat()
+
+    if not force:
+        existing_log = conn.execute(
+            "SELECT id FROM harvest_log WHERE file_path = ? AND file_hash = ? AND status = 'complete'",
+            (str(jsonl_path), fhash),
+        ).fetchone()
+        if existing_log:
+            stats["skipped"] = True
+            stats["status"] = "skipped"
+            return stats
+
+    if dry_run:
+        stats["skipped"] = True
+        stats["status"] = "skipped"
+        return stats
+
+    lines, decode_errors = load_jsonl_records(jsonl_path)
+    stats["errors"] += decode_errors
+    if decode_errors:
+        stats["status"] = "error"
+        return stats
+
+    if not lines:
+        stats["status"] = "error" if decode_errors else "unknown_format"
+        stats["unknown_format"] = not decode_errors
+        return stats
+
+    fmt = detect_transcript_format(lines)
+    if fmt == "unknown":
+        stats["unknown_format"] = True
+        stats["status"] = "unknown_format"
+        return stats
+    if expected_provider and fmt != expected_provider:
+        stats["unknown_format"] = True
+        stats["status"] = "unknown_format"
+        return stats
+
+    if fmt == "codex":
+        native_id = extract_codex_session_id(lines)
+        if not native_id:
+            stats["unknown_format"] = True
+            stats["status"] = "unknown_format"
+            return stats
+        provider = "codex"
+        session_uuid = qualify_id("codex", native_id)
+        parent_id = None
+        for rec in lines:
+            if isinstance(rec, dict) and rec.get("type") == "session_meta":
+                payload = _payload(rec) or rec
+                parent_native = payload.get("parent_id") or payload.get("parent_session_id") or payload.get("forked_from_id")
+                if parent_native:
+                    parent_id = qualify_id("codex", parent_native)
+                break
+    else:
+        provider = "claude-code"
+        source_ids = {str(row["sessionId"]) for row in lines if row.get("sessionId")}
+        if len(source_ids) > 1:
+            stats["status"] = "conflict"
+            stats["conflict"] = True
+            return stats
+        native_id = next(iter(source_ids)) if source_ids else jsonl_path.stem
+        session_uuid = native_id
+        parent_id = None
+
+    stats["session_uuid"] = session_uuid
+    stats["provider"] = provider
+
+    existing_session = conn.execute(
+        "SELECT id, jsonl_path, source_path FROM sessions WHERE session_uuid = ? AND source = ?",
+        (session_uuid, provider),
+    ).fetchone()
+    if existing_session:
+        existing_path = existing_session["source_path"] or existing_session["jsonl_path"]
+        if existing_path and _norm_path(existing_path) != _norm_path(jsonl_path) and Path(existing_path).exists():
+            stats["conflict"] = True
+            stats["status"] = "conflict"
+            return stats
+
+    conn.execute("SAVEPOINT harvest_file")
+    try:
+        if fmt == "codex":
+            _harvest_codex_into(
+                conn,
+                jsonl_path,
+                lines,
+                stats,
+                existing_session,
+                session_uuid,
+                native_id,
+                parent_id,
+                project_path,
+                fhash,
+                fsize,
+                fmtime,
+            )
+        else:
+            _harvest_claude_into(
+                conn,
+                jsonl_path,
+                lines,
+                stats,
+                existing_session,
+                session_uuid,
+                project_path,
+                fhash,
+                fsize,
+                fmtime,
+            )
+        conn.execute("RELEASE SAVEPOINT harvest_file")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT harvest_file")
+        conn.execute("RELEASE SAVEPOINT harvest_file")
+        raise
+    return stats
+
+
+def _harvest_claude_into(
+    conn,
+    jsonl_path,
+    lines,
+    stats,
+    existing_session,
+    session_uuid,
+    project_path,
+    fhash,
+    fsize,
+    fmtime,
+):
+    first_ts = None
+    last_ts = None
+    models_seen = set()
+    version = None
+    first_prompt = None
+    domain_signals = []
+    total_input = 0
+    total_output = 0
+    total_cache_create = 0
+    total_cache_read = 0
+    user_count = 0
+    assistant_count = 0
+    tool_count = 0
+    compact_count = 0
+    pending_tool_uses = {}
+    file_ops_tracker = {}
+    source_path = str(jsonl_path)
+    project_str = str(project_path) if project_path else str(jsonl_path.parent)
+
+    session_id = _open_session_row(
+        conn,
+        session_uuid=session_uuid,
+        source="claude-code",
+        provider="claude-code",
+        native_session_id=session_uuid,
+        parent_id=None,
+        project_path=project_str,
+        jsonl_path=jsonl_path,
+        started_at=_ts_or_now(None),
+        raw_line_count=len(lines),
+        existing=existing_session,
     )
 
-    return stats
+    def bump_ts(timestamp):
+        nonlocal first_ts, last_ts
+        if not timestamp:
+            return
+        if first_ts is None or timestamp < first_ts:
+            first_ts = timestamp
+        if last_ts is None or timestamp > last_ts:
+            last_ts = timestamp
+
+    for seq_num, record in enumerate(lines):
+        if not isinstance(record, dict):
+            continue
+        rtype = record.get("type")
+        timestamp = parse_timestamp(record.get("timestamp"))
+        bump_ts(timestamp)
+        native_msg = record.get("uuid")
+        parent_msg = record.get("parentUuid")
+        agent_id = record.get("agentId")
+        agent_slug = record.get("agentSlug") or record.get("slug")
+
+        if rtype == "user":
+            msg = record.get("message", {})
+            content = msg.get("content")
+            content_text = extract_text_content(content)
+            is_sidechain = 1 if record.get("isSidechain") else 0
+            if record.get("version"):
+                version = record["version"]
+            tool_results = extract_tool_results(content) if isinstance(content, list) else []
+            if tool_results:
+                for tr in tool_results:
+                    msg_id = _insert_message(
+                        conn,
+                        session_id=session_id,
+                        uuid=native_msg,
+                        native_id=native_msg,
+                        parent_uuid=parent_msg,
+                        timestamp=_ts_or_now(timestamp),
+                        role="tool_result",
+                        message_type="user",
+                        content_text=tr["content"][:5000],
+                        content_json=json.dumps(content) if content else None,
+                        raw_json=json.dumps(record),
+                        sequence_num=seq_num,
+                        source_path=source_path,
+                        is_sidechain=is_sidechain,
+                        agent_id=agent_id,
+                        agent_slug=agent_slug,
+                    )
+                    stats["messages"] += 1
+                    tuid = tr["tool_use_id"]
+                    if tuid in pending_tool_uses:
+                        conn.execute(
+                            "UPDATE tool_uses SET result_message_id = ?, result_text = ?, is_error = ? WHERE id = ?",
+                            (
+                                msg_id,
+                                tr["content"][:10000],
+                                1 if tr["is_error"] else 0,
+                                pending_tool_uses[tuid],
+                            ),
+                        )
+                        del pending_tool_uses[tuid]
+            else:
+                if not record.get("isMeta") and content_text and first_prompt is None:
+                    first_prompt = content_text[:500]
+                    domain_signals.append(content_text)
+                if not record.get("isMeta") and content_text:
+                    user_count += 1
+                    domain_signals.append(content_text)
+                _insert_message(
+                    conn,
+                    session_id=session_id,
+                    uuid=native_msg,
+                    native_id=native_msg,
+                    parent_uuid=parent_msg,
+                    timestamp=_ts_or_now(timestamp),
+                    role="user",
+                    message_type="user",
+                    content_text=content_text,
+                    content_json=json.dumps(content) if isinstance(content, list) else None,
+                    raw_json=json.dumps(record),
+                    sequence_num=seq_num,
+                    source_path=source_path,
+                    is_sidechain=is_sidechain,
+                    agent_id=agent_id,
+                    agent_slug=agent_slug,
+                )
+                stats["messages"] += 1
+
+        elif rtype == "assistant":
+            msg = record.get("message", {})
+            content = msg.get("content", [])
+            content_text = extract_text_content(content)
+            model = msg.get("model")
+            usage = msg.get("usage", {}) if isinstance(msg.get("usage"), dict) else {}
+            if model and model != "<synthetic>":
+                models_seen.add(model)
+            in_tok = usage.get("input_tokens", 0) or 0
+            out_tok = usage.get("output_tokens", 0) or 0
+            cc_tok = usage.get("cache_creation_input_tokens", 0) or 0
+            cr_tok = usage.get("cache_read_input_tokens", 0) or 0
+            total_input += in_tok
+            total_output += out_tok
+            total_cache_create += cc_tok
+            total_cache_read += cr_tok
+            assistant_count += 1
+            msg_id = _insert_message(
+                conn,
+                session_id=session_id,
+                uuid=native_msg,
+                native_id=native_msg,
+                parent_uuid=parent_msg,
+                timestamp=_ts_or_now(timestamp),
+                role="assistant",
+                message_type="assistant",
+                content_text=content_text,
+                content_json=json.dumps(content) if isinstance(content, list) else None,
+                raw_json=json.dumps(record),
+                sequence_num=seq_num,
+                source_path=source_path,
+                model=model,
+                request_id=msg.get("id"),
+                stop_reason=msg.get("stop_reason"),
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                cache_create_tokens=cc_tok,
+                cache_read_tokens=cr_tok,
+                is_sidechain=1 if record.get("isSidechain") else 0,
+                agent_id=agent_id,
+                agent_slug=agent_slug,
+            )
+            stats["messages"] += 1
+            if content_text:
+                domain_signals.append(content_text)
+            for tu in extract_tool_uses_from_content(content):
+                tool_count += 1
+                tu_id = _insert_tool_use(
+                    conn,
+                    message_id=msg_id,
+                    session_id=session_id,
+                    tool_use_id=tu["tool_use_id"],
+                    native_id=tu["tool_use_id"],
+                    tool_name=tu["tool_name"],
+                    input_obj=tu["input"],
+                    timestamp=_ts_or_now(timestamp),
+                    file_path=tu.get("file_path"),
+                    command=tu.get("command"),
+                    pattern=tu.get("pattern"),
+                    description=tu.get("description"),
+                )
+                pending_tool_uses[tu["tool_use_id"]] = tu_id
+                stats["tool_uses"] += 1
+                _track_file_op(file_ops_tracker, tu["tool_name"], tu.get("file_path"), timestamp)
+
+        elif rtype == "system":
+            subtype = record.get("subtype")
+            if subtype == "compact_boundary":
+                compact_count += 1
+                summary_content = record.get("summary")
+                if isinstance(summary_content, list):
+                    summary_content = extract_text_content(summary_content)
+                elif isinstance(summary_content, str):
+                    pass
+                else:
+                    summary_content = None
+                msg_id = _insert_message(
+                    conn,
+                    session_id=session_id,
+                    uuid=native_msg,
+                    native_id=native_msg,
+                    parent_uuid=parent_msg,
+                    timestamp=_ts_or_now(timestamp),
+                    role="system",
+                    message_type="system",
+                    content_text=summary_content,
+                    content_json=None,
+                    raw_json=json.dumps(record),
+                    sequence_num=seq_num,
+                    source_path=source_path,
+                    subtype=subtype,
+                    is_compact_summary=1,
+                    agent_id=agent_id,
+                    agent_slug=agent_slug,
+                )
+                if summary_content:
+                    conn.execute(
+                        "INSERT INTO compactions (session_id, message_id, pre_tokens, summary_text, timestamp) VALUES (?, ?, ?, ?, ?)",
+                        (
+                            session_id,
+                            msg_id,
+                            record.get("preTokens"),
+                            summary_content,
+                            _ts_or_now(timestamp),
+                        ),
+                    )
+            else:
+                _insert_message(
+                    conn,
+                    session_id=session_id,
+                    uuid=native_msg,
+                    native_id=native_msg,
+                    parent_uuid=parent_msg,
+                    timestamp=_ts_or_now(timestamp),
+                    role="system",
+                    message_type="system",
+                    content_text=str(record.get("content", ""))[:1000],
+                    content_json=None,
+                    raw_json=json.dumps(record),
+                    sequence_num=seq_num,
+                    source_path=source_path,
+                    subtype=subtype,
+                    agent_id=agent_id,
+                    agent_slug=agent_slug,
+                )
+            stats["messages"] += 1
+
+    _insert_file_ops(conn, session_id, file_ops_tracker, stats)
+    primary_domain, domains_str = _classify_session_domain(domain_signals, file_ops_tracker)
+    primary_model = _primary_model(models_seen)
+    total_cost = 0.0
+    if primary_model:
+        total_cost = estimate_cost(
+            primary_model,
+            total_input,
+            total_output,
+            total_cache_create,
+            total_cache_read,
+        )
+    summary, first_prompt = _load_claude_summary(project_str, session_uuid, first_prompt)
+
+    subagent_files = discover_subagent_files(jsonl_path)
+    subagent_count = 0
+    seq_base = len(lines)
+    for sa_file in subagent_files:
+        agent_id = _agent_id_from_subagent_path(sa_file)
+        conn.execute("SAVEPOINT harvest_subagent")
+        try:
+            sa_stats = _harvest_subagent_file(
+                conn,
+                session_id,
+                sa_file,
+                agent_id,
+                seq_base,
+                pending_tool_uses,
+                file_ops_tracker,
+                domain_signals,
+            )
+            conn.execute("RELEASE SAVEPOINT harvest_subagent")
+        except (OSError, sqlite3.Error, json.JSONDecodeError, ValueError) as exc:
+            conn.execute("ROLLBACK TO SAVEPOINT harvest_subagent")
+            conn.execute("RELEASE SAVEPOINT harvest_subagent")
+            raise ValueError(f"Subagent harvest failed; prior session preserved: {sa_file.name}") from exc
+        seq_base += sa_stats.get("records", 0)
+        stats["messages"] += sa_stats["messages"]
+        stats["tool_uses"] += sa_stats["tool_uses"]
+        stats["errors"] += sa_stats["errors"]
+        user_count += sa_stats["user_count"]
+        assistant_count += sa_stats["assistant_count"]
+        tool_count += sa_stats["tool_count"]
+        if sa_stats["model"]:
+            models_seen.add(sa_stats["model"])
+        conn.execute(
+            """INSERT OR REPLACE INTO subagents
+               (session_id, agent_id, slug, model, jsonl_path,
+                message_count, tool_use_count, input_tokens, output_tokens,
+                started_at, ended_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                session_id,
+                agent_id,
+                sa_stats["slug"],
+                sa_stats["model"],
+                str(sa_file),
+                sa_stats["sa_msgs"],
+                sa_stats["sa_tools"],
+                sa_stats["sa_in"],
+                sa_stats["sa_out"],
+                sa_stats["first_ts"],
+                sa_stats["last_ts"],
+            ),
+        )
+        subagent_count += 1
+
+    _finalize_session_row(
+        conn,
+        session_id,
+        first_ts=first_ts,
+        last_ts=last_ts,
+        primary_domain=primary_domain,
+        domains_str=domains_str,
+        summary=summary,
+        primary_model=primary_model,
+        models_seen=models_seen,
+        version=version,
+        total_input=total_input,
+        total_output=total_output,
+        total_cache_create=total_cache_create,
+        total_cache_read=total_cache_read,
+        total_cost=total_cost,
+        stats=stats,
+        user_count=user_count,
+        assistant_count=assistant_count,
+        tool_count=tool_count,
+        file_ops_tracker=file_ops_tracker,
+        compact_count=compact_count,
+        subagent_count=subagent_count,
+        first_prompt=first_prompt,
+        line_count=len(lines),
+    )
+    _write_complete_harvest_log(
+        conn, jsonl_path, fhash, fsize, fmtime, session_uuid, "claude-code", len(lines), stats["messages"]
+    )
+
+
+def _harvest_subagent_file(
+    conn,
+    session_id,
+    sa_file: Path,
+    agent_id: str,
+    seq_base: int,
+    pending_tool_uses: dict,
+    file_ops_tracker: dict,
+    domain_signals: list,
+) -> dict:
+    """Ingest nested Claude subagent JSONL into the parent session."""
+    result = {
+        "messages": 0,
+        "tool_uses": 0,
+        "errors": 0,
+        "user_count": 0,
+        "assistant_count": 0,
+        "tool_count": 0,
+        "sa_msgs": 0,
+        "sa_tools": 0,
+        "sa_in": 0,
+        "sa_out": 0,
+        "slug": None,
+        "model": None,
+        "first_ts": None,
+        "last_ts": None,
+        "records": 0,
+    }
+    lines, decode_errors = load_jsonl_records(sa_file)
+    result["errors"] += decode_errors
+    if decode_errors:
+        raise ValueError("Malformed subagent transcript; prior session preserved")
+    result["records"] = len(lines)
+    source_path = str(sa_file)
+    for seq_num, record in enumerate(lines):
+        if not isinstance(record, dict):
+            continue
+        if record.get("slug") and not result["slug"]:
+            result["slug"] = record["slug"]
+        rtype = record.get("type")
+        timestamp = parse_timestamp(record.get("timestamp"))
+        if timestamp:
+            if result["first_ts"] is None or timestamp < result["first_ts"]:
+                result["first_ts"] = timestamp
+            if result["last_ts"] is None or timestamp > result["last_ts"]:
+                result["last_ts"] = timestamp
+        native_msg = record.get("uuid")
+        parent_msg = record.get("parentUuid")
+        rec_agent = record.get("agentId") or agent_id
+        agent_slug = record.get("agentSlug") or record.get("slug") or result["slug"]
+        if rtype in ("user", "assistant"):
+            result["sa_msgs"] += 1
+        if rtype == "user":
+            msg = record.get("message", {})
+            content = msg.get("content")
+            content_text = extract_text_content(content)
+            tool_results = extract_tool_results(content) if isinstance(content, list) else []
+            if tool_results:
+                for tr in tool_results:
+                    msg_id = _insert_message(
+                        conn,
+                        session_id=session_id,
+                        uuid=native_msg,
+                        native_id=native_msg,
+                        parent_uuid=parent_msg,
+                        timestamp=_ts_or_now(timestamp),
+                        role="tool_result",
+                        message_type="user",
+                        content_text=tr["content"][:5000],
+                        content_json=json.dumps(content) if content else None,
+                        raw_json=json.dumps(record),
+                        sequence_num=seq_base + seq_num,
+                        source_path=source_path,
+                        is_sidechain=1,
+                        agent_id=rec_agent,
+                        agent_slug=agent_slug,
+                    )
+                    result["messages"] += 1
+                    tuid = tr["tool_use_id"]
+                    if tuid in pending_tool_uses:
+                        conn.execute(
+                            "UPDATE tool_uses SET result_message_id = ?, result_text = ?, is_error = ? WHERE id = ?",
+                            (
+                                msg_id,
+                                tr["content"][:10000],
+                                1 if tr["is_error"] else 0,
+                                pending_tool_uses[tuid],
+                            ),
+                        )
+            elif content_text:
+                result["user_count"] += 1
+                _insert_message(
+                    conn,
+                    session_id=session_id,
+                    uuid=native_msg,
+                    native_id=native_msg,
+                    parent_uuid=parent_msg,
+                    timestamp=_ts_or_now(timestamp),
+                    role="user",
+                    message_type="user",
+                    content_text=content_text,
+                    content_json=json.dumps(content) if isinstance(content, list) else None,
+                    raw_json=json.dumps(record),
+                    sequence_num=seq_base + seq_num,
+                    source_path=source_path,
+                    is_sidechain=1,
+                    agent_id=rec_agent,
+                    agent_slug=agent_slug,
+                )
+                result["messages"] += 1
+                domain_signals.append(content_text)
+        elif rtype == "assistant":
+            msg = record.get("message", {})
+            content = msg.get("content", [])
+            content_text = extract_text_content(content)
+            model = msg.get("model")
+            usage = msg.get("usage", {}) if isinstance(msg.get("usage"), dict) else {}
+            if model:
+                result["model"] = model
+            result["sa_in"] += usage.get("input_tokens", 0) or 0
+            result["sa_out"] += usage.get("output_tokens", 0) or 0
+            result["assistant_count"] += 1
+            msg_id = _insert_message(
+                conn,
+                session_id=session_id,
+                uuid=native_msg,
+                native_id=native_msg,
+                parent_uuid=parent_msg,
+                timestamp=_ts_or_now(timestamp),
+                role="assistant",
+                message_type="assistant",
+                content_text=content_text,
+                content_json=json.dumps(content) if isinstance(content, list) else None,
+                raw_json=json.dumps(record),
+                sequence_num=seq_base + seq_num,
+                source_path=source_path,
+                model=model,
+                request_id=msg.get("id"),
+                stop_reason=msg.get("stop_reason"),
+                input_tokens=usage.get("input_tokens", 0) or 0,
+                output_tokens=usage.get("output_tokens", 0) or 0,
+                cache_create_tokens=usage.get("cache_creation_input_tokens", 0) or 0,
+                cache_read_tokens=usage.get("cache_read_input_tokens", 0) or 0,
+                is_sidechain=1,
+                agent_id=rec_agent,
+                agent_slug=agent_slug,
+            )
+            result["messages"] += 1
+            if content_text:
+                domain_signals.append(content_text)
+            for tu in extract_tool_uses_from_content(content):
+                result["tool_count"] += 1
+                result["sa_tools"] += 1
+                tu_id = _insert_tool_use(
+                    conn,
+                    message_id=msg_id,
+                    session_id=session_id,
+                    tool_use_id=tu["tool_use_id"],
+                    native_id=tu["tool_use_id"],
+                    tool_name=tu["tool_name"],
+                    input_obj=tu["input"],
+                    timestamp=_ts_or_now(timestamp),
+                    file_path=tu.get("file_path"),
+                    command=tu.get("command"),
+                    pattern=tu.get("pattern"),
+                    description=tu.get("description"),
+                )
+                pending_tool_uses[tu["tool_use_id"]] = tu_id
+                result["tool_uses"] += 1
+                _track_file_op(file_ops_tracker, tu["tool_name"], tu.get("file_path"), timestamp)
+    return result
+
+
+def _harvest_codex_into(
+    conn,
+    jsonl_path,
+    lines,
+    stats,
+    existing_session,
+    session_uuid,
+    native_id,
+    parent_id,
+    project_path,
+    fhash,
+    fsize,
+    fmtime,
+):
+    first_ts = None
+    last_ts = None
+    models_seen = set()
+    version = None
+    first_prompt = None
+    cwd = None
+    total_input = 0
+    total_output = 0
+    total_cache_create = 0
+    total_cache_read = 0
+    user_count = 0
+    assistant_count = 0
+    tool_count = 0
+    pending_tool_uses = {}
+    file_ops_tracker = {}
+    domain_signals = []
+    response_texts = {extract_text_content(_payload(r).get("content")) for r in lines
+                      if r.get("type") == "response_item" and _payload(r).get("type") == "message"
+                      and _payload(r).get("role") == "assistant"}
+    source_path = str(jsonl_path)
+
+    for record in lines:
+        if not isinstance(record, dict) or record.get("type") != "session_meta":
+            continue
+        payload = _payload(record) or record
+        cwd = payload.get("cwd") or payload.get("project_path") or cwd
+        version = payload.get("cli_version") or payload.get("version") or version
+        if payload.get("model"):
+            models_seen.add(payload["model"])
+        ts = parse_timestamp(record.get("timestamp") or payload.get("timestamp"))
+        if ts:
+            first_ts = ts if first_ts is None or ts < first_ts else first_ts
+            last_ts = ts if last_ts is None or ts > last_ts else last_ts
+
+    project_str = str(project_path) if project_path else cwd
+    session_id = _open_session_row(
+        conn,
+        session_uuid=session_uuid,
+        source="codex",
+        provider="codex",
+        native_session_id=native_id,
+        parent_id=parent_id,
+        project_path=project_str,
+        jsonl_path=jsonl_path,
+        started_at=_ts_or_now(first_ts),
+        raw_line_count=len(lines),
+        existing=existing_session,
+    )
+
+    def bump_ts(timestamp):
+        nonlocal first_ts, last_ts
+        if not timestamp:
+            return
+        if first_ts is None or timestamp < first_ts:
+            first_ts = timestamp
+        if last_ts is None or timestamp > last_ts:
+            last_ts = timestamp
+
+    def remember_tool(native_call_id, tu_id):
+        if not native_call_id:
+            return
+        pending_tool_uses[str(native_call_id)] = tu_id
+        pending_tool_uses[qualify_id("codex", native_call_id)] = tu_id
+
+    for seq_num, record in enumerate(lines):
+        if not isinstance(record, dict):
+            continue
+        rtype = record.get("type")
+        payload = _payload(record)
+        timestamp = parse_timestamp(record.get("timestamp") or payload.get("timestamp"))
+        bump_ts(timestamp)
+
+        if rtype == "session_meta":
+            continue
+
+        if rtype == "turn_context":
+            model = payload.get("model")
+            if model:
+                models_seen.add(model)
+            continue
+
+        if rtype == "response_item":
+            item_type = payload.get("type")
+            if item_type == "message":
+                role = payload.get("role") or "assistant"
+                content = payload.get("content")
+                content_text = extract_text_content(content)
+                native_msg = payload.get("id") or record.get("id")
+                parent_msg = payload.get("parent_id") or record.get("parent_id")
+                model = payload.get("model")
+                if model:
+                    models_seen.add(model)
+                if role == "user":
+                    db_role = "user"
+                    user_count += 1
+                    if content_text and first_prompt is None:
+                        first_prompt = content_text[:500]
+                    if content_text:
+                        domain_signals.append(content_text)
+                elif role == "assistant":
+                    db_role = "assistant"
+                    assistant_count += 1
+                    if content_text:
+                        domain_signals.append(content_text)
+                elif role == "system":
+                    db_role = "system"
+                else:
+                    db_role = "system"
+                _insert_message(
+                    conn,
+                    session_id=session_id,
+                    uuid=qualify_id("codex", native_msg),
+                    native_id=str(native_msg) if native_msg else None,
+                    parent_uuid=qualify_id("codex", parent_msg),
+                    timestamp=_ts_or_now(timestamp),
+                    role=db_role,
+                    message_type="message",
+                    content_text=content_text,
+                    content_json=json.dumps(content) if content is not None else None,
+                    raw_json=json.dumps(record),
+                    sequence_num=seq_num,
+                    source_path=source_path,
+                    model=model,
+                )
+                stats["messages"] += 1
+
+            elif item_type in ("function_call", "custom_tool_call"):
+                native_call = payload.get("call_id") or payload.get("id")
+                name = payload.get("name") or payload.get("tool_name") or ""
+                parsed_input = _parse_tool_arguments(payload.get("arguments") if item_type == "function_call" else payload.get("input"))
+                file_path, command, pattern, description = _denormalize_tool_fields(parsed_input)
+                assistant_count += 1
+                msg_id = _insert_message(
+                    conn,
+                    session_id=session_id,
+                    uuid=qualify_id("codex", native_call),
+                    native_id=str(native_call) if native_call else None,
+                    parent_uuid=None,
+                    timestamp=_ts_or_now(timestamp),
+                    role="assistant",
+                    message_type=item_type,
+                    content_text=None,
+                    content_json=json.dumps(payload) if payload else None,
+                    raw_json=json.dumps(record),
+                    sequence_num=seq_num,
+                    source_path=source_path,
+                    model=payload.get("model"),
+                )
+                stats["messages"] += 1
+                tool_count += 1
+                tu_id = _insert_tool_use(
+                    conn,
+                    message_id=msg_id,
+                    session_id=session_id,
+                    tool_use_id=qualify_id("codex", native_call) or "",
+                    native_id=str(native_call) if native_call else None,
+                    tool_name=name,
+                    input_obj=parsed_input,
+                    timestamp=_ts_or_now(timestamp),
+                    file_path=file_path,
+                    command=command,
+                    pattern=pattern,
+                    description=description,
+                )
+                remember_tool(native_call, tu_id)
+                stats["tool_uses"] += 1
+                _track_file_op(file_ops_tracker, name, file_path, timestamp)
+
+            elif item_type in ("function_call_output", "custom_tool_call_output"):
+                native_call = payload.get("call_id") or payload.get("id")
+                output = payload.get("output")
+                if isinstance(output, str):
+                    output_text = output
+                elif output is None:
+                    output_text = None
+                else:
+                    output_text = json.dumps(output)
+                is_error = False
+                if isinstance(payload.get("is_error"), bool):
+                    is_error = payload["is_error"]
+                msg_id = _insert_message(
+                    conn,
+                    session_id=session_id,
+                    uuid=qualify_id("codex", native_call),
+                    native_id=str(native_call) if native_call else None,
+                    parent_uuid=None,
+                    timestamp=_ts_or_now(timestamp),
+                    role="tool_result",
+                    message_type=item_type,
+                    content_text=(output_text if output_text else None),
+                    content_json=json.dumps(payload) if payload else None,
+                    raw_json=json.dumps(record),
+                    sequence_num=seq_num,
+                    source_path=source_path,
+                )
+                stats["messages"] += 1
+                tu_row = None
+                if native_call is not None:
+                    tu_row = pending_tool_uses.get(str(native_call)) or pending_tool_uses.get(
+                        qualify_id("codex", native_call)
+                    )
+                if tu_row is not None:
+                    conn.execute(
+                        "UPDATE tool_uses SET result_message_id = ?, result_text = ?, is_error = ? WHERE id = ?",
+                        (
+                            msg_id,
+                            (output_text if output_text else None),
+                            1 if is_error else 0,
+                            tu_row,
+                        ),
+                    )
+
+            # Other response_item types stay in the source file only.
+
+        elif rtype == "event_msg":
+            etype = payload.get("type")
+            if etype == "token_count":
+                info = payload.get("info") if isinstance(payload.get("info"), dict) else payload
+                total_usage = info.get("total_token_usage") if isinstance(info, dict) else None
+                if isinstance(total_usage, dict):
+                    if isinstance(total_usage.get("input_tokens"), int):
+                        total_input = total_usage["input_tokens"]
+                    if isinstance(total_usage.get("output_tokens"), int):
+                        total_output = total_usage["output_tokens"]
+                    if isinstance(total_usage.get("cached_input_tokens"), int):
+                        total_cache_read = total_usage["cached_input_tokens"]
+                    if isinstance(total_usage.get("cache_creation_input_tokens"), int):
+                        total_cache_create = total_usage["cache_creation_input_tokens"]
+                else:
+                    if isinstance(payload.get("input_tokens"), int):
+                        total_input = payload["input_tokens"]
+                    if isinstance(payload.get("output_tokens"), int):
+                        total_output = payload["output_tokens"]
+                continue
+
+            if etype in ("agent_message_delta", "user_message"):
+                continue
+            if etype == "agent_message":
+                text = payload.get("message") or payload.get("text")
+                if text in response_texts:
+                    continue
+                if not text:
+                    continue
+                assistant_count += 1
+                _insert_message(
+                    conn,
+                    session_id=session_id,
+                    uuid=None,
+                    native_id=None,
+                    parent_uuid=None,
+                    timestamp=_ts_or_now(timestamp),
+                    role="assistant",
+                    message_type="event_msg",
+                    content_text=str(text),
+                    content_json=json.dumps(payload) if payload else None,
+                    raw_json=json.dumps(record),
+                    sequence_num=seq_num,
+                    source_path=source_path,
+                )
+                stats["messages"] += 1
+                domain_signals.append(str(text))
+
+    _insert_file_ops(conn, session_id, file_ops_tracker, stats)
+    primary_domain, domains_str = _classify_session_domain(domain_signals, file_ops_tracker)
+    primary_model = _primary_model(models_seen)
+    total_cost = 0.0
+    if primary_model:
+        total_cost = estimate_cost(
+            primary_model,
+            total_input,
+            total_output,
+            total_cache_create,
+            total_cache_read,
+        )
+    _finalize_session_row(
+        conn,
+        session_id,
+        first_ts=first_ts,
+        last_ts=last_ts,
+        primary_domain=primary_domain,
+        domains_str=domains_str,
+        summary=None,
+        primary_model=primary_model,
+        models_seen=models_seen,
+        version=version,
+        total_input=total_input,
+        total_output=total_output,
+        total_cache_create=total_cache_create,
+        total_cache_read=total_cache_read,
+        total_cost=total_cost,
+        stats=stats,
+        user_count=user_count,
+        assistant_count=assistant_count,
+        tool_count=tool_count,
+        file_ops_tracker=file_ops_tracker,
+        compact_count=0,
+        subagent_count=0,
+        first_prompt=first_prompt,
+        line_count=len(lines),
+    )
+    _write_complete_harvest_log(
+        conn, jsonl_path, fhash, fsize, fmtime, session_uuid, "codex", len(lines), stats["messages"]
+    )
 
 
 def build_concurrency_groups(conn: sqlite3.Connection):
@@ -1224,7 +2522,7 @@ def build_concurrency_groups(conn: sqlite3.Connection):
     conn.execute("UPDATE sessions SET concurrency_group_id = NULL")
 
     sessions = conn.execute(
-        "SELECT id, session_uuid, started_at, ended_at, primary_domain FROM sessions ORDER BY started_at"
+        "SELECT id, session_uuid, started_at, ended_at, primary_domain FROM sessions WHERE started_at IS NOT NULL AND started_at != '' ORDER BY started_at"
     ).fetchall()
 
     if not sessions:
@@ -1451,102 +2749,267 @@ def harvest_vault_files(conn: sqlite3.Connection, vault_root: Path,
     return stats
 
 
-def cmd_harvest(args):
-    """Ingest JSONL transcripts and vault files into the database."""
-    conn = get_db()
+def _empty_receipt() -> dict:
+    return {
+        "roots": [],
+        "discovered": 0,
+        "harvested": 0,
+        "skipped": 0,
+        "errors": 0,
+        "unknown_formats": 0,
+        "conflicts": 0,
+        "messages": 0,
+        "tool_uses": 0,
+        "notes": [],
+    }
 
-    # Ensure schema exists
-    conn.executescript(SCHEMA_SQL)
-    conn.executescript(SEED_PRICING_SQL)
-    conn.commit()
 
-    source = args.source
-
-    # ── JSONL Transcripts ──
-    if source in ("claude-code", "all"):
-        if args.session:
-            jsonl_files = [PROJECTS_DIR / f"{args.session}.jsonl"]
-            jsonl_files = [f for f in jsonl_files if f.exists()]
-        elif PROJECTS_DIR.is_dir():
-            jsonl_files = sorted(
-                [f for f in PROJECTS_DIR.iterdir() if f.suffix == ".jsonl" and f.is_file()],
-                key=lambda p: p.stat().st_mtime
-            )
+def print_harvest_receipt(receipt: dict):
+    print("\nHarvest receipt")
+    print("  Configured roots:")
+    if not receipt["roots"]:
+        print("    (none)")
+    for root in receipt["roots"]:
+        if root["available"]:
+            state = "available"
         else:
-            jsonl_files = []
+            reason = root.get("reason") or "unavailable"
+            state = f"unavailable ({reason})"
+        print(f"    {root['name']}: {root['path']} — {state}")
+    print(f"  Discovered: {receipt['discovered']}")
+    print(f"  Harvested:  {receipt['harvested']}")
+    print(f"  Skipped:    {receipt['skipped']}")
+    print(f"  Errors:     {receipt['errors']}")
+    print(f"  Unknown formats: {receipt['unknown_formats']}")
+    print(f"  Conflicts:  {receipt['conflicts']}")
+    unavailable = [r for r in receipt["roots"] if not r["available"]]
+    if unavailable:
+        print("  Note: unavailable roots mean coverage is unknown.")
+    if receipt["discovered"] == 0:
+        print("  Note: 0 discovered files is not evidence of complete coverage.")
+    for note in receipt.get("notes", []):
+        print(f"  Note: {note}")
 
-        if args.since:
-            cutoff = datetime.strptime(args.since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            jsonl_files = [
-                f for f in jsonl_files
-                if datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc) >= cutoff
-            ]
 
-        total = len(jsonl_files)
-        harvested = 0
-        skipped = 0
-        total_msgs = 0
-        total_tools = 0
-        errors = 0
+def _filter_since(paths: list, since: "str | None") -> list:
+    if not since:
+        return paths
+    cutoff = datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    kept = []
+    for path in paths:
+        try:
+            mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        except OSError:
+            continue
+        if mtime >= cutoff:
+            kept.append(path)
+    return kept
 
-        print(f"[transcripts] {total} JSONL file(s)")
 
-        for i, jf in enumerate(jsonl_files, 1):
-            try:
-                result = harvest_jsonl(conn, jf, dry_run=args.dry_run, force=args.full)
-                if result["skipped"]:
-                    skipped += 1
-                else:
-                    harvested += 1
-                    total_msgs += result["messages"]
-                    total_tools += result["tool_uses"]
-                    errors += result["errors"]
+def _session_filename_match(path: Path, session_id: str) -> bool:
+    needle = session_id.removeprefix("codex:")
+    records, errors = load_jsonl_records(path)
+    if errors:
+        return False
+    native = extract_codex_session_id(records)
+    ids = {str(r["sessionId"]) for r in records if r.get("sessionId")}
+    if native:
+        ids.add(native)
+    if not ids:
+        ids.add(path.stem)
+    return needle in ids
+
+
+def _harvest_paths(
+    conn: sqlite3.Connection,
+    files: list,
+    receipt: dict,
+    *,
+    dry_run: bool,
+    force: bool,
+    expected_provider: str,
+    project_lookup: dict,
+):
+    total = len(files)
+    for i, jf in enumerate(files, 1):
+        receipt["discovered"] += 1
+        project_path = project_lookup.get(str(jf))
+        try:
+            result = harvest_jsonl(
+                conn,
+                jf,
+                dry_run=dry_run,
+                force=force,
+                project_path=project_path,
+                expected_provider=expected_provider,
+            )
+            status = result.get("status")
+            if result.get("skipped"):
+                receipt["skipped"] += 1
+            elif result.get("conflict") or status == "conflict":
+                receipt["conflicts"] += 1
+                conn.rollback()
+                if not dry_run:
+                    _write_error_harvest_log(
+                        conn,
+                        jf,
+                        "conflicting duplicate identity",
+                        result.get("session_uuid"),
+                        result.get("provider") or expected_provider,
+                    )
                     conn.commit()
-
-                if i % 10 == 0 or i == total:
-                    pct = int(i / total * 100)
-                    sys.stdout.write(f"\r  [{pct:3d}%] {i}/{total} — {harvested} harvested, {skipped} skipped")
-                    sys.stdout.flush()
-
-            except Exception as e:
-                errors += 1
-                print(f"\n  ERROR: {jf.name}: {e}")
-                conn.execute(
-                    "INSERT OR REPLACE INTO harvest_log (file_path, file_hash, file_size, harvested_at, status, error_text, harvest_version) VALUES (?, '', 0, ?, 'error', ?, ?)",
-                    (str(jf), datetime.now(timezone.utc).isoformat(), str(e), SCHEMA_VERSION)
-                )
+            elif result.get("unknown_format") or status == "unknown_format":
+                receipt["unknown_formats"] += 1
+                conn.rollback()
+                if not dry_run:
+                    _write_error_harvest_log(
+                        conn,
+                        jf,
+                        "unknown transcript format",
+                        result.get("session_uuid"),
+                        expected_provider,
+                    )
+                    conn.commit()
+            elif status == "error":
+                receipt["errors"] += 1
+                conn.rollback()
+                if not dry_run:
+                    _write_error_harvest_log(
+                        conn,
+                        jf,
+                        "malformed input",
+                        result.get("session_uuid"),
+                        expected_provider,
+                    )
+                    conn.commit()
+            else:
+                receipt["harvested"] += 1
+                receipt["messages"] += result.get("messages", 0)
+                receipt["tool_uses"] += result.get("tool_uses", 0)
+                receipt["errors"] += result.get("errors", 0)
+                conn.commit()
+        except Exception as exc:
+            receipt["errors"] += 1
+            print(f"\n  ERROR: {jf.name}: {exc}")
+            conn.rollback()
+            if not dry_run:
+                _write_error_harvest_log(conn, jf, str(exc), provider=expected_provider)
                 conn.commit()
 
+        if total and (i % 10 == 0 or i == total):
+            pct = int(i / total * 100)
+            sys.stdout.write(
+                f"\r  [{pct:3d}%] {i}/{total} — {receipt['harvested']} harvested, {receipt['skipped']} skipped"
+            )
+            sys.stdout.flush()
+    if total:
         print()
 
-        if harvested > 0 and not args.dry_run:
-            print("  Building concurrency groups...")
-            build_concurrency_groups(conn)
-            conn.commit()
 
-        print(f"  Transcripts: {harvested} harvested, {skipped} unchanged, {errors} errors")
-        print(f"  Messages: {total_msgs:,} | Tool uses: {total_tools:,}")
+def cmd_harvest(args):
+    """Ingest JSONL transcripts and vault files into the database."""
+    if args.dry_run:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+    else:
+        conn = get_db()
+    ensure_schema(conn)
 
-    # ── Vault Files ──
-    if source in ("vault", "all"):
-        print(f"\n[vault] Indexing Obsidian vault...")
-        vault_stats = harvest_vault_files(
-            conn, VAULT_ROOT,
+    source = args.source
+    receipt = _empty_receipt()
+
+    if source in ("claude-code", "all"):
+        project_dirs, claude_root = discover_claude_project_dirs()
+        receipt["roots"].append(claude_root)
+        discovered = discover_claude_session_files(project_dirs)
+        if args.session:
+            discovered = [
+                item for item in discovered if _session_filename_match(item["path"], args.session)
+            ]
+        jsonl_files = [item["path"] for item in discovered]
+        jsonl_files = _filter_since(jsonl_files, args.since)
+        project_lookup = {str(item["path"]): item["project_path"] for item in discovered}
+        print(f"[claude-code] {len(jsonl_files)} JSONL file(s)")
+        _harvest_paths(
+            conn,
+            jsonl_files,
+            receipt,
             dry_run=args.dry_run,
             force=args.full,
-            since=args.since,
+            expected_provider="claude-code",
+            project_lookup=project_lookup,
         )
-        print(f"  Vault: {vault_stats['indexed']} new, {vault_stats['updated']} updated, "
-              f"{vault_stats['skipped']} unchanged, {vault_stats['errors']} errors")
 
-    # Final summary
+    if source in ("codex", "all"):
+        codex_files, codex_root = discover_codex_jsonl(get_codex_dir())
+        receipt["roots"].append(codex_root)
+        receipt["roots"].extend(codex_root.get("children", []))
+        if args.session:
+            codex_files = [path for path in codex_files if _session_filename_match(path, args.session)]
+        codex_files = _filter_since(codex_files, args.since)
+        print(f"[codex] {len(codex_files)} JSONL file(s)")
+        _harvest_paths(
+            conn,
+            codex_files,
+            receipt,
+            dry_run=args.dry_run,
+            force=args.full,
+            expected_provider="codex",
+            project_lookup={},
+        )
+
+    if source in ("vault", "all"):
+        vault_root = get_vault_root()
+        if vault_root is None:
+            receipt["roots"].append(
+                _root_status("vault", Path("LEDGER_VAULT"), False, "not configured")
+            )
+            print("[vault] LEDGER_VAULT is not set — vault harvest skipped")
+            receipt["notes"].append("Set LEDGER_VAULT to index markdown files.")
+        elif not _path_exists(vault_root):
+            receipt["roots"].append(_root_status("vault", vault_root, False, "missing"))
+            print(f"[vault] root unavailable: {vault_root}")
+        elif not _path_is_dir(vault_root):
+            receipt["roots"].append(_root_status("vault", vault_root, False, "not a directory"))
+            print(f"[vault] root unavailable: {vault_root}")
+        else:
+            receipt["roots"].append(_root_status("vault", vault_root, True))
+            print("[vault] Indexing markdown files...")
+            vault_stats = harvest_vault_files(
+                conn,
+                vault_root,
+                dry_run=args.dry_run,
+                force=args.full,
+                since=args.since,
+            )
+            print(
+                f"  Vault: {vault_stats['indexed']} new, {vault_stats['updated']} updated, "
+                f"{vault_stats['skipped']} unchanged, {vault_stats['errors']} errors"
+            )
+            receipt["errors"] += vault_stats["errors"]
+
+    if receipt["harvested"] > 0 and not args.dry_run:
+        print("  Building concurrency groups...")
+        build_concurrency_groups(conn)
+        conn.commit()
+
+    print(
+        f"  Transcripts: {receipt['harvested']} harvested, {receipt['skipped']} unchanged, "
+        f"{receipt['errors']} errors"
+    )
+    print(f"  Messages: {receipt['messages']:,} | Tool uses: {receipt['tool_uses']:,}")
+    print_harvest_receipt(receipt)
+
     db_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
     vault_count = conn.execute("SELECT COUNT(*) FROM vault_files").fetchone()[0]
     session_count = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
     msg_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-    print(f"\n  DB: {db_size / 1024 / 1024:.1f} MB | {session_count} sessions | {msg_count:,} messages | {vault_count:,} vault files")
-
+    print(
+        f"\n  DB: {db_size / 1024 / 1024:.1f} MB | {session_count} sessions | "
+        f"{msg_count:,} messages | {vault_count:,} vault files"
+    )
     conn.close()
+    return 1 if receipt["errors"] or receipt["conflicts"] or receipt["unknown_formats"] else 0
 
 
 # ---------------------------------------------------------------------------
@@ -1622,8 +3085,9 @@ def cmd_sessions(args):
     if args.subcmd == "show" and args.uuid:
         # Show single session
         row = conn.execute(
-            "SELECT * FROM v_recent_sessions WHERE session_uuid LIKE ?",
-            (f"{args.uuid}%",)
+            """SELECT * FROM v_recent_sessions
+               WHERE session_uuid LIKE ? OR native_session_id LIKE ?""",
+            (f"{args.uuid}%", f"{args.uuid}%"),
         ).fetchone()
 
         if not row:
@@ -1910,14 +3374,31 @@ def cmd_status(args):
         "SELECT MAX(harvested_at) FROM harvest_log"
     ).fetchone()[0]
 
-    # Count unharvested JSONL files
-    if PROJECTS_DIR.is_dir():
-        all_jsonl = [f for f in PROJECTS_DIR.iterdir() if f.suffix == ".jsonl" and f.is_file()]
-        total_jsonl = len(all_jsonl)
-        total_jsonl_size = sum(f.stat().st_size for f in all_jsonl)
+    project_dirs, claude_root = discover_claude_project_dirs()
+    claude_files = discover_claude_session_files(project_dirs)
+    codex_files, codex_root = discover_codex_jsonl(get_codex_dir())
+    vault_root = get_vault_root()
+    if vault_root is None:
+        vault_status = _root_status("vault", Path("LEDGER_VAULT"), False, "not configured")
+    elif not _path_exists(vault_root):
+        vault_status = _root_status("vault", vault_root, False, "missing")
+    elif not _path_is_dir(vault_root):
+        vault_status = _root_status("vault", vault_root, False, "not a directory")
     else:
-        total_jsonl = 0
-        total_jsonl_size = 0
+        vault_status = _root_status("vault", vault_root, True)
+
+    total_jsonl = len(claude_files) + len(codex_files)
+    total_jsonl_size = 0
+    for item in claude_files:
+        try:
+            total_jsonl_size += item["path"].stat().st_size
+        except OSError:
+            pass
+    for path in codex_files:
+        try:
+            total_jsonl_size += path.stat().st_size
+        except OSError:
+            pass
 
     print(f"\n  Session Ledger — Status")
     print(f"  {'─'*40}")
@@ -1930,8 +3411,14 @@ def cmd_status(args):
     print(f"  Harvested:     {harvested} files")
     print(f"  Errors:        {errored} files")
     print(f"  Last harvest:  {last_harvest or 'never'}")
+    print("  Configured roots:")
+    for root in (claude_root, codex_root, vault_status):
+        state = "available" if root["available"] else f"unavailable ({root['reason']})"
+        print(f"    {root['name']}: {root['path']} — {state}")
     print(f"  JSONL source:  {total_jsonl} files, {total_jsonl_size / 1024 / 1024:.1f} MB")
     print(f"  Pending:       ~{total_jsonl - harvested} files")
+    if total_jsonl == 0:
+        print("  Note: 0 discovered files is not evidence of complete coverage.")
 
     conn.close()
 
@@ -1939,6 +3426,120 @@ def cmd_status(args):
 # ---------------------------------------------------------------------------
 # Query command
 # ---------------------------------------------------------------------------
+
+
+def _omit_empty(value):
+    if value is None:
+        return True
+    if value == "":
+        return True
+    if value == {}:
+        return True
+    if value == []:
+        return True
+    return False
+
+
+def _strip_empty(obj):
+    if isinstance(obj, dict):
+        return {k: _strip_empty(v) for k, v in obj.items() if not _omit_empty(v)}
+    if isinstance(obj, list):
+        return [_strip_empty(v) for v in obj]
+    return obj
+
+
+def shared_record_for_session(conn: sqlite3.Connection, row) -> dict:
+    """Build a shared export record from stored columns. Do not invent values."""
+    session_pk = row["id"] if "id" in row.keys() else None
+    if session_pk is None:
+        session_pk = conn.execute(
+            "SELECT id FROM sessions WHERE session_uuid = ? AND source = ?",
+            (row["session_uuid"], row["source"]),
+        ).fetchone()[0]
+    messages = conn.execute(
+        "SELECT * FROM messages WHERE session_id = ? ORDER BY sequence_num, id",
+        (session_pk,),
+    ).fetchall()
+    tools = conn.execute(
+        "SELECT * FROM tool_uses WHERE session_id = ? ORDER BY id",
+        (session_pk,),
+    ).fetchall()
+    tools_by_msg = {}
+    for tool in tools:
+        tools_by_msg.setdefault(tool["message_id"], []).append(tool)
+
+    out_messages = []
+    for msg in messages:
+        rec = {
+            "source_record": json.loads(msg["raw_json"]) if msg["raw_json"] else None,
+            "id": msg["uuid"],
+            "native_id": msg["native_id"] if "native_id" in msg.keys() else None,
+            "parent_id": msg["parent_uuid"],
+            "role": msg["role"],
+            "timestamp": msg["timestamp"],
+            "text": msg["content_text"],
+            "model": msg["model"],
+            "source_path": msg["source_path"] if "source_path" in msg.keys() else None,
+        }
+        msg_tools = tools_by_msg.get(msg["id"], [])
+        if msg_tools:
+            rec["tool_calls"] = []
+            for tool in msg_tools:
+                raw_input = tool["input_json"]
+                parsed_input = None
+                if raw_input:
+                    try:
+                        parsed_input = json.loads(raw_input)
+                    except json.JSONDecodeError:
+                        parsed_input = raw_input
+                rec["tool_calls"].append(
+                    {
+                        "id": tool["tool_use_id"],
+                        "native_id": tool["native_id"] if "native_id" in tool.keys() else None,
+                        "name": tool["tool_name"],
+                        "input": parsed_input,
+                        "output": tool["result_text"],
+                        "is_error": bool(tool["is_error"]) if tool["is_error"] is not None else None,
+                    }
+                )
+        out_messages.append(rec)
+
+    record = {
+        "provider": (row["provider"] if "provider" in row.keys() else None) or row["source"],
+        "session_id": row["session_uuid"],
+        "native_session_id": row["native_session_id"] if "native_session_id" in row.keys() else None,
+        "parent_id": row["parent_id"] if "parent_id" in row.keys() else None,
+        "source_path": (row["source_path"] if "source_path" in row.keys() else None)
+        or row["jsonl_path"]
+        if "jsonl_path" in row.keys()
+        else None,
+        "started_at": row["started_at"],
+        "ended_at": row["ended_at"] if "ended_at" in row.keys() else None,
+        "model": row["primary_model"] if "primary_model" in row.keys() else None,
+        "messages": out_messages,
+    }
+    return _strip_empty(record)
+
+
+def cmd_export(args):
+    """Write shared records as JSON."""
+    conn = get_db()
+    sql = "SELECT * FROM sessions"
+    params = []
+    if args.session:
+        sql += " WHERE session_uuid LIKE ? OR native_session_id LIKE ?"
+        params.extend([f"{args.session}%", f"{args.session}%"])
+    sql += " ORDER BY started_at"
+    rows = conn.execute(sql, params).fetchall()
+    records = [shared_record_for_session(conn, row) for row in rows]
+    indent = 2 if args.pretty or args.format == "json" else None
+    payload = json.dumps(records, indent=indent, ensure_ascii=False)
+    if args.out:
+        Path(args.out).write_text(payload + "\n", encoding="utf-8")
+        print(f"Wrote {len(records)} record(s) to {args.out}")
+    else:
+        print(payload)
+    conn.close()
 
 
 def cmd_query(args):
@@ -1984,7 +3585,7 @@ def cmd_query(args):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ledger",
-        description="Session Ledger — Full-fidelity Claude session transcript database",
+        description="Session Ledger — Claude and Codex session transcript database",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument("--db", type=Path, default=DB_PATH, help="Database path")
@@ -1997,7 +3598,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     # harvest
     h = sub.add_parser("harvest", help="Ingest JSONL transcripts")
-    h.add_argument("--source", choices=["claude-code", "all"], default="claude-code")
+    h.add_argument(
+        "--source",
+        choices=["claude-code", "codex", "vault", "all"],
+        default="claude-code",
+        help="Source to harvest (default: claude-code)",
+    )
     h.add_argument("--full", action="store_true", help="Force re-harvest all files")
     h.add_argument("--dry-run", action="store_true", help="Preview without writing")
     h.add_argument("--since", help="Only files modified after YYYY-MM-DD")
@@ -2033,6 +3639,12 @@ def build_parser() -> argparse.ArgumentParser:
     # status
     sub.add_parser("status", help="Database health")
 
+    # export
+    ex = sub.add_parser("export", help="Write shared records as JSON")
+    ex.add_argument("--session", help="Session UUID or native id prefix")
+    ex.add_argument("--out", type=Path, help="Output file (default: stdout)")
+    ex.add_argument("--pretty", action="store_true", help="Indent JSON output")
+
     # query
     q = sub.add_parser("query", help="Run SQL query")
     q.add_argument("sql", help="SQL statement")
@@ -2052,7 +3664,7 @@ def main():
     if args.command == "init":
         cmd_init(args)
     elif args.command == "harvest":
-        cmd_harvest(args)
+        raise SystemExit(cmd_harvest(args))
     elif args.command == "search":
         cmd_search(args)
     elif args.command == "sessions":
@@ -2063,6 +3675,8 @@ def main():
         cmd_stats(args)
     elif args.command == "status":
         cmd_status(args)
+    elif args.command == "export":
+        cmd_export(args)
     elif args.command == "query":
         cmd_query(args)
     else:

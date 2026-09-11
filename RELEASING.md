@@ -1,6 +1,8 @@
 # Build a macOS release
 
 You need arm64 macOS and Python 3.14.3 for this build.
+Source 0.2.0 changes ingestion and schema behavior. Existing v0.1.0 assets remain unchanged.
+Run the synthetic regression suite before building.
 Run these commands from the repository root:
 
 ```bash
