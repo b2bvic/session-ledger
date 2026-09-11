@@ -1,12 +1,20 @@
 # session-ledger
 
-A zero-dependency SQLite archive and search tool for local session records.
+You can lose earlier decisions and tool results across separate Claude Code transcripts. Use session-ledger to archive those records in SQLite and search them from your terminal.
 
-## Principle cluster
+Install with Python 3.11+ and curl. You need no pip packages:
 
-This repository demonstrates **P02 (own the memory plane)** and **P03 (continuity compounds)** because it harvests JSONL records into indexed storage while tracking messages, file operations, errors, and skipped inputs.
+```bash
+mkdir -p "$HOME/.local/bin" && curl -fsSL https://raw.githubusercontent.com/b2bvic/session-ledger/main/ledger -o "$HOME/.local/bin/ledger" && chmod +x "$HOME/.local/bin/ledger"
+```
 
-[Read the principles](https://victorvalentineromo.com/principles).
+Sample output from `~/.local/bin/ledger search "authentication bug"` when your initialized database has no matches:
+
+```text
+No results for: authentication bug
+```
+
+Run `~/.local/bin/ledger init` and `~/.local/bin/ledger harvest` before you search your transcripts.
 
 ## Worked example
 
@@ -35,3 +43,9 @@ MIT.
 This 2026 README refit used model assistance.
 
 No claim is made about how the underlying code was authored or reviewed.
+
+## Principles
+
+This repository demonstrates **P02 (own the memory plane)** and **P03 (continuity compounds)** because it harvests JSONL records into indexed storage while tracking messages, file operations, errors, and skipped inputs.
+
+[Read the principles](https://victorvalentineromo.com/principles).
