@@ -1,114 +1,95 @@
-# session-ledger
+# AI agent session audit trail: session-ledger
 
-You can lose earlier decisions and tool results across separate Claude Code and Codex transcripts. Use session-ledger to archive those records in SQLite and search them from your terminal.
+Session-ledger archives local Claude Code and Codex CLI transcripts in SQLite for operators who use hosted models.
+It keeps an AI agent session audit trail when decisions and tool results span separate sessions.
 
-Install with Python 3.11+ and curl. You need no pip packages:
+[Project page](https://scalewithsearch.com/code/session-ledger)
 
-```bash
-mkdir -p "$HOME/.local/bin" && curl -fsSL https://raw.githubusercontent.com/b2bvic/session-ledger/main/ledger -o "$HOME/.local/bin/ledger" && chmod +x "$HOME/.local/bin/ledger"
-```
+## Install
 
-Sample output from `~/.local/bin/ledger search "authentication bug"` when your initialized database has no matches:
-
-```text
-No results for: authentication bug
-```
-
-Run `~/.local/bin/ledger init` and `~/.local/bin/ledger harvest --source all` before you search both providers.
-
-## Worked example
+Use Git and Python 3.11 or newer with SQLite FTS5 support. The runtime needs no pip packages.
 
 ```bash
-./ledger init
-./ledger harvest
-./ledger search "authentication bug"
+git clone https://github.com/b2bvic/session-ledger.git
+cd session-ledger
 ```
 
-## Data boundary
+For a source installation after review:
 
-The default database is local SQLite storage under the Claude configuration
-directory. `harvest` reads local JSONL transcripts from your selected providers. It records
-messages, file operations, errors, and skipped inputs; it does not verify that
-the archived statements are correct.
+```bash
+mkdir -p "$HOME/.local/bin"
+install -m 755 ledger "$HOME/.local/bin/ledger"
+```
 
-Use `./ledger --help` and each subcommand's help before changing paths or
-retention behavior.
+## Quick start
 
-## Source selection
+Create an isolated database without reading your session history:
 
-Source version 0.2.0 adds Codex ingestion and all-project Claude discovery.
-The existing v0.1.0 release binary does not include these changes. The install command follows the source on `main`.
+```bash
+demo_record=$(mktemp -d)
+mkdir -p "$demo_record/claude/projects" "$demo_record/codex/sessions"
+export LEDGER_DB="$demo_record/sessions.db"
+export LEDGER_CLAUDE="$demo_record/claude"
+export LEDGER_CODEX="$demo_record/codex"
+unset LEDGER_PROJECT LEDGER_VAULT
+python3 ./ledger init
+python3 ./ledger harvest --source all
+python3 ./ledger search "authentication bug"
+python3 ./ledger export --pretty --out "$demo_record/sessions.json"
+```
+
+The empty example reports missing coverage and no search matches.
+Set the source roots to your own transcript directories before importing session history.
+This provides Claude Code session history and a Codex CLI session archive.
+Run `harvest --dry-run --source all` to preview ingestion with an in-memory database.
+
+## How it works
+
+The ledger discovers local JSONL files and imports messages, tool records, file operations, and parse errors.
+SQLite FTS5 transcript search indexes the stored text.
+Provider identifiers keep Claude and Codex records separate when native session identifiers collide.
+JSON export includes provider, session identities, source paths, messages, correlated tools, and available parsed source records.
+The database and JSON export remain files you control. Changing model tools requires a compatible transcript adapter.
+These are recordkeeping patterns a team can adopt; an archived statement remains a statement until you verify its outcome.
 
 | Setting | Purpose |
 |---|---|
-| `LEDGER_CLAUDE` | Claude configuration directory. The default is `~/.claude`. |
-| `LEDGER_PROJECT` | Limit Claude discovery to one project directory. Otherwise, scan all projects. |
-| `LEDGER_CODEX` | Codex configuration directory. The default is `~/.codex`. |
-| `LEDGER_DB` or `--db` | Select the local database. |
-| `LEDGER_VAULT` | Optional Markdown root for `--source vault` or `--source all`. |
+| `LEDGER_DB` or `--db` | Select the SQLite database. |
+| `LEDGER_CLAUDE` | Select the Claude configuration root. |
+| `LEDGER_PROJECT` | Restrict Claude discovery to one project. |
+| `LEDGER_CODEX` | Select the Codex configuration root. |
+| `LEDGER_VAULT` | Select an optional Markdown root for vault ingestion. |
 
-```bash
-ledger harvest --source claude-code
-ledger harvest --source codex
-ledger harvest --source all
-ledger harvest --dry-run --source all
-```
+Plain `harvest` defaults to Claude. Use `--source codex` or `--source all` for other sources.
+Codex discovery includes `sessions/` and `archived_sessions/` recursively.
+Read each coverage receipt even when the command returns zero.
 
-Plain `harvest` retains its Claude-only default. Codex discovery includes `sessions/` and `archived_sessions/` recursively.
-The receipt lists configured roots, unavailable inputs, discovered files, skips, errors, unknown formats, and identity conflicts.
-Zero discovered files does not establish complete coverage.
-`--since` filters files by modification time. It is an ingestion shortcut, not an event-time usage window.
-
-Dry runs use an in-memory database and do not create or change your configured database.
-Malformed transcripts and child files preserve the previous session snapshot. Fix the input before retrying.
-A changed child transcript causes a parent-session refresh even when the parent file is unchanged.
-Conflicting identities in different existing files are rejected. Moving a source to the archive can refresh its stored path.
-Harvest returns exit 1 for reported input errors, unknown formats, or identity conflicts.
-Read the coverage receipt even when the command returns zero.
-
-## Shared record export
-
-```bash
-ledger export --pretty --out ./sessions.json
-ledger export --session codex:YOUR_SESSION_ID --pretty
-```
-
-The export contains provider, stored and native session identifiers, parent identifier when available, source paths, messages, and correlated tools.
-Each message includes its parsed source record when available. Missing source timestamps stay unknown rather than becoming the harvest time.
-Codex session identifiers come from `session_meta`, including renamed exports.
-Claude identifiers use `sessionId` when present and retain filename fallback for older files.
-Codex stored identifiers have a `codex:` prefix. Interpret message and tool identifiers within their provider and session.
-
-Codex ingestion supports message, function-call, custom-tool-call, tool-output, and native cumulative token records.
-Mirrored assistant event messages do not duplicate matching response-item text in search.
-Other record types are not guaranteed to be indexed. The source file remains the complete input record.
-
-The additive schema migration preserves version-one tables and existing sessions.
-Back up your database before an upgrade. Use a copy to confirm your own transcript coverage first.
-Legacy cost estimates retain their historical model table. An unsupported model can show zero; that value does not mean free usage.
-Use the monitor for timestamp-filtered observations, and your provider for billing.
-
-## Verify
+Run the regression suite:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-Tests use isolated synthetic transcripts and databases. They cover migration, source discovery, resumed children, malformed-input preservation, provider identities, and export.
-See [Build a macOS release](RELEASING.md) for packaging.
+## Limits
+
+- Missing roots and zero discovered files leave coverage unknown.
+- `--since` filters file modification times. It is an ingestion shortcut, not an event-time usage window.
+- Supported transcript schemas cover the implemented parsers. Other record types can remain unindexed.
+- Malformed inputs preserve the prior session snapshot. Identity conflicts and unknown formats return a failing harvest status.
+- Dry runs do not create or change the configured database.
+- The additive schema migration preserves version-one data. Back up the database before an upgrade.
+- Legacy model cost tables can return zero for unsupported models. Use provider billing for account charges.
+- Source version 0.2.0 includes Codex ingestion. Compare an installed binary’s version with this checkout before an upgrade.
+
+See [Build a macOS release](RELEASING.md) for packaging instructions.
+
+## Related repositories
+
+- [agent-oversight](https://github.com/b2bvic/agent-oversight): orchestration cluster and evaluation guide.
+- [agent-monitor](https://github.com/b2bvic/agent-monitor): timestamp-filtered usage observations.
+- [skills](https://github.com/b2bvic/skills): session search and local artifact checks.
+- [owned-record](https://github.com/b2bvic/owned-record): owned memory cluster.
 
 ## License
 
-MIT.
-
-## How this was built
-
-This 2026 README refit used model assistance.
-
-No claim is made about how the underlying code was authored or reviewed.
-
-## Principles
-
-This repository demonstrates **P02 (own the memory plane)** and **P03 (continuity compounds)** because it harvests JSONL records into indexed storage while tracking messages, file operations, errors, and skipped inputs.
-
-[Read the principles](https://victorvalentineromo.com/principles).
+[MIT](LICENSE).
