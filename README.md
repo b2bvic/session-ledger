@@ -90,6 +90,10 @@ See [Build a macOS release](RELEASING.md) for packaging instructions.
 - [skills](https://github.com/b2bvic/skills): session search and local artifact checks.
 - [owned-record](https://github.com/b2bvic/owned-record): owned memory cluster.
 
+## How this was built
+
+This README was written with model assistance in 2026. The code and tests in this repository are the evidence; read them to judge the tool.
+
 ## License
 
 [MIT](LICENSE).
